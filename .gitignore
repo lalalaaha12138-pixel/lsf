@@ -1,0 +1,27 @@
+# Qt Creator 用户级配置
+*.pro.user
+*.pro.user.*
+*.autosave
+
+# qmake / 编译产物
+.qmake.stash
+Makefile
+Makefile.*
+debug/
+release/
+build-*/
+*.o
+*.obj
+*.exe
+*.dll
+
+# Qt 自动生成文件
+ui_*.h
+moc_*.cpp
+qrc_*.cpp
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
