@@ -23,6 +23,7 @@ MyDemux 解封装
 | `widget.h/.cpp` | 播放流程控制层，连接解封装器、解码器和渲染控件 |
 | `mydemux.h/.cpp` | FFmpeg 解封装封装类，读取媒体流和压缩数据包 |
 | `mydecode.h/.cpp` | FFmpeg 解码封装类，将 `AVPacket` 解码为 `AVFrame` |
+| `videothread.h/.cpp` | 视频工作线程和视频包队列，在线程中解码并复制 YUV420P |
 | `audiothread.h/.cpp` | 音频工作线程和音频包队列，串联解码、重采样与播放 |
 | `audioresample.h/.cpp` | 使用 libswresample 将解码音频转换为设备 PCM 格式 |
 | `playaudio.h/.cpp` | 封装 Qt `QAudioOutput`，控制默认音频设备和 PCM 写入 |
@@ -38,14 +39,11 @@ classDiagram
         -Ui~Widget~ *ui
         -videoOpenGLWidget *m_videoWidget
         -MyDemux m_demux
-        -MyDecode m_videoDecoder
+        -videoThread m_videoThread
         -audioThread m_audioThread
-        -AVFrame *m_videoFrame
-        -QTimer m_decodeTimer
-        -bool m_draining
+        -QTimer m_packetTimer
         +openMedia(QString fileName) bool
-        -decodeNextFrame()
-        -presentFrame() bool
+        -dispatchNextPackets()
         -stopPlayback()
     }
 
@@ -77,11 +75,21 @@ classDiagram
     class videoOpenGLWidget {
         -QByteArray m_frameData
         -GLuint m_textures[3]
-        +setFrame(const AVFrame *frame) bool
+        +setFrame(QByteArray data, int width, int height) bool
         +clearFrame()
         #initializeGL()
         #resizeGL(int w, int h)
         #paintGL()
+    }
+
+    class videoThread {
+        -MyDecode m_decoder
+        -QQueue~AVPacket*~ m_packets
+        +open(AVCodecParameters *parameters) bool
+        +pushPacket(AVPacket *packet) bool
+        +finishPackets()
+        +stopVideo()
+        #run()
     }
 
     class audioThread {
@@ -111,23 +119,24 @@ classDiagram
 
     QWidget <|-- Widget
     QOpenGLWidget <|-- videoOpenGLWidget
+    QThread <|-- videoThread
     QThread <|-- audioThread
     QAudioOutput <|-- PlayAudio
     Widget *-- MyDemux : 持有
-    Widget *-- MyDecode : 持有
     Widget *-- videoOpenGLWidget : 创建并持有
+    Widget *-- videoThread : 持有
     Widget *-- audioThread : 持有
+    videoThread *-- MyDecode : 视频解码器
     audioThread *-- MyDecode : 音频解码器
     audioThread *-- AudioResample : 重采样器
     audioThread *-- PlayAudio : 在线程内创建
-    Widget --> AVFrame : 复用一个解码帧
     MyDemux --> AVPacket : 创建压缩包
     MyDecode --> AVPacket : 接收
     MyDecode --> AVFrame : 填充
-    videoOpenGLWidget --> AVFrame : 读取并复制 YUV 数据
+    videoThread --> videoOpenGLWidget : QByteArray YUV 数据
 ```
 
-`Widget` 是整个播放器的协调者和唯一解封装入口。它将视频包交给视频解码器，将音频包转交给 `audioThread` 的线程安全队列，避免两个线程同时从同一个 `AVFormatContext` 读取数据。
+`Widget` 是整个播放器的协调者和唯一解封装入口。它将视频包、音频包分别转交给 `videoThread`、`audioThread` 的线程安全队列，避免两个线程同时从同一个 `AVFormatContext` 读取数据。
 
 ## 4. 播放时序
 
@@ -136,7 +145,7 @@ sequenceDiagram
     participant Main as main.cpp
     participant Player as Widget
     participant Demux as MyDemux
-    participant Decoder as MyDecode
+    participant VideoThread as videoThread
     participant Renderer as videoOpenGLWidget
     participant AudioThread as audioThread
     participant Resample as AudioResample
@@ -146,41 +155,32 @@ sequenceDiagram
     Player->>Demux: open(url)
     Player->>Demux: getVideoParameters()
     Demux-->>Player: AVCodecParameters*
-    Player->>Decoder: open(parameters)
+    Player->>VideoThread: open(videoParameters)
     Player->>Demux: getAudioParameters()
     Player->>AudioThread: open(audioParameters)
     AudioThread->>Audio: 在线程内打开默认设备
     Player->>Demux: videoFrameRate()
-    Player->>Player: 启动 m_decodeTimer
+    Player->>Player: 启动 m_packetTimer
 
     loop 每个视频帧周期
-        Player->>Decoder: receiveFrame(frame)
-        alt 已有解码帧
-            Decoder-->>Player: 0
-        else 需要更多输入
-            Decoder-->>Player: AVERROR(EAGAIN)
-            Player->>Demux: read()
-            Demux-->>Player: AVPacket*
-            Player->>Demux: packetType(packet)
-            alt 视频包
-                Player->>Decoder: sendPacket(packet)
-                Player->>Decoder: receiveFrame(frame)
-            else 音频包
-                Player->>AudioThread: pushPacket(packet)
-                AudioThread->>AudioThread: 解码为音频 AVFrame
-                AudioThread->>Resample: convert(frame, outputFormat)
-                Resample-->>AudioThread: PCM
-                AudioThread->>Audio: write(PCM)
-            end
+        Player->>Demux: read() / packetType()
+        alt 视频包
+            Player->>VideoThread: pushPacket(packet)
+            VideoThread->>VideoThread: sendPacket / receiveFrame
+            VideoThread->>VideoThread: 复制紧密排列的 YUV420P
+            VideoThread-->>Renderer: frameReady(QByteArray, width, height)
+            Renderer->>Renderer: setFrame() / update() / paintGL()
+        else 音频包
+            Player->>AudioThread: pushPacket(packet)
+            AudioThread->>AudioThread: sendPacket / receiveFrame
+            AudioThread->>Resample: convert(frame, outputFormat)
+            Resample-->>AudioThread: PCM
+            AudioThread->>Audio: write(PCM)
         end
-        Player->>Renderer: setFrame(frame)
-        Renderer->>Renderer: 复制 Y/U/V 数据并调用 update()
-        Player->>Player: av_frame_unref(frame)
-        Renderer->>Renderer: paintGL() 上传纹理并绘制
     end
 ```
 
-文件结束时，`Widget` 调用 `sendPacket(nullptr)` 通知解码器进入 drain 状态，将 B 帧等仍缓存在解码器内部的延迟帧全部取出。
+文件结束时，`Widget` 调用两个线程的 `finishPackets()`。线程在包队列清空后分别调用 `sendPacket(nullptr)`，取出仍缓存在解码器内部的延迟帧。
 
 ## 5. `MyDemux`：解封装类
 
@@ -337,11 +337,50 @@ sequenceDiagram
 
 调用 `avcodec_free_context()` 释放解码上下文。函数可重复调用。
 
-## 7. `videoOpenGLWidget`：视频渲染类
+## 7. `videoThread`：视频工作线程
+
+`videoThread` 继承 `QThread`，持有视频 `MyDecode` 和线程安全的 `AVPacket` 队列。视频解码从 GUI 线程迁移到 `run()` 后，`Widget` 不再直接参与 FFmpeg 的 send/receive 状态机。
+
+### `bool open(AVCodecParameters *parameters)`
+
+停止上一段视频线程、打开视频解码器、重置退出和 EOF 状态并启动线程。函数接管 `parameters` 所有权。
+
+### `bool pushPacket(AVPacket *packet)`
+
+将视频包加入队列并唤醒线程。函数接管包所有权；线程停止或不再接收包时也会立即释放该包。
+
+### `void finishPackets()`
+
+标记解封装输入已经结束。队列处理完成后，`run()` 向解码器发送空包，输出 B 帧等延迟帧。
+
+### `void stopVideo()`
+
+设置退出标志、唤醒条件变量、等待线程退出，然后释放队列中的包并关闭视频解码器。
+
+### `void run()`
+
+循环执行以下流程：
+
+1. 优先调用 `receiveFrame()` 取走已有输出。
+2. 返回 `EAGAIN` 时等待并取得下一个视频包。
+3. 使用 `sendPacket()` 投递压缩包。
+4. 收到 YUV420P 帧后调用 `copyYuv420pFrame()`。
+5. 发出 `frameReady(QByteArray, width, height)` 信号。
+6. EOF 时排空解码器，退出时释放 `AVFrame`、队列和解码器。
+
+### `bool copyYuv420pFrame(const AVFrame *frame, QByteArray *frameData)`
+
+验证输入为 `AV_PIX_FMT_YUV420P`，再根据三个平面的 `linesize` 逐行复制数据，最终形成紧密排列的 `Y + U + V`。这一步在线程内完成，发给 GUI 的数据不再依赖解码器 `AVFrame` 的生命周期。
+
+### `void frameReady(const QByteArray &frameData, int width, int height)`
+
+跨线程视频帧信号。`QByteArray` 采用隐式共享，信号排队传输时只增加引用计数；GUI 收到后再交给 `videoOpenGLWidget`。
+
+## 8. `videoOpenGLWidget`：视频渲染类
 
 ### 职责
 
-- 接收并复制 YUV420P 格式的 `AVFrame`。
+- 接收 `videoThread` 已整理好的紧密 YUV420P 数据。
 - 根据视频实际分辨率创建 Y、U、V 三张纹理。
 - 将三个 YUV 平面上传到 GPU。
 - 在片元着色器中把 YUV 转换成 RGB。
@@ -357,9 +396,9 @@ sequenceDiagram
 | U | `data[1]` | `ceil(width / 2) × ceil(height / 2)` |
 | V | `data[2]` | `ceil(width / 2) × ceil(height / 2)` |
 
-`AVFrame::linesize[]` 可能大于平面实际宽度，因为 FFmpeg 会进行内存对齐。因此 `setFrame()` 按行复制每个平面，跳过行尾填充，并在 `m_frameData` 中形成紧密排列的 `Y + U + V` 数据。
+`AVFrame::linesize[]` 可能大于平面实际宽度，因为 FFmpeg 会进行内存对齐。该问题已由 `videoThread::copyYuv420pFrame()` 处理，渲染控件收到的数据中三个平面按 `Y + U + V` 紧密排列。
 
-不能只保存 `data[0]`、`data[1]`、`data[2]` 指针，因为 `Widget::presentFrame()` 会在 `setFrame()` 返回后立即调用 `av_frame_unref()`，原始指针随即失效；而 Qt 的 `paintGL()` 是稍后执行的。
+不能把 `AVFrame::data[]` 指针直接排队传给 GUI，因为视频线程会立即复用 `AVFrame`。因此跨线程传递的是拥有独立生命周期的 `QByteArray`。
 
 ### 公共函数
 
@@ -371,17 +410,16 @@ sequenceDiagram
 
 调用 `cleanupOpenGL()` 删除着色器程序、纹理、VAO 和 VBO。
 
-#### `bool setFrame(const AVFrame *frame)`
+#### `bool setFrame(const QByteArray &frameData, int width, int height)`
 
 接收一个解码帧：
 
-1. 检查帧指针、尺寸和三个数据平面。
-2. 检查格式是否为 `AV_PIX_FMT_YUV420P`。
-3. 按 `linesize` 逐行复制 Y、U、V。
-4. 更新缓存尺寸并将 `m_frameDirty` 设为 `true`。
-5. 调用 `update()` 请求 Qt 在合适时间执行 `paintGL()`。
+1. 检查宽高和数据长度是否满足 YUV420P 布局。
+2. 通过 `QByteArray` 隐式共享保存帧数据。
+3. 更新缓存尺寸并将 `m_frameDirty` 设为 `true`。
+4. 调用 `update()` 请求 Qt 在合适时间执行 `paintGL()`。
 
-成功返回 `true`。其他像素格式会输出警告并返回 `false`，目前不会自动转换。
+成功返回 `true`，尺寸或数据长度无效时返回 `false`。像素格式验证由 `videoThread` 完成。
 
 #### `void clearFrame()`
 
@@ -445,7 +483,7 @@ OpenGL 上下文创建完成后由 Qt 自动调用：
 
 将控件上下文设为当前上下文，删除纹理、VBO、VAO 和 shader program，然后重置资源句柄。控件从未创建上下文时直接返回。
 
-## 8. `PlayAudio`：音频设备播放类
+## 9. `PlayAudio`：音频设备播放类
 
 Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不能被继承。`PlayAudio` 因此继承真正执行声音输出的 `QAudioOutput`，这是用户要求中“继承 QAudio”的可编译等价实现。
 
@@ -465,7 +503,7 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 停止 `QAudioOutput` 并清除内部 `QIODevice` 指针。`PlayAudio` 在 `audioThread::run()` 中创建、使用和销毁，避免跨线程调用 Qt 音频对象。
 
-## 9. `AudioResample`：音频重采样类
+## 10. `AudioResample`：音频重采样类
 
 `AudioResample` 使用 FFmpeg `libswresample`，将解码器输出的采样率、声道布局和采样格式统一转换成 `PlayAudio::format()` 要求的交错 PCM。
 
@@ -493,7 +531,7 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 释放 `SwrContext` 和保存的输入声道布局，并重置所有格式缓存。
 
-## 10. `audioThread`：音频工作线程
+## 11. `audioThread`：音频工作线程
 
 `audioThread` 继承 `QThread`。它持有 `MyDecode`、`AudioResample` 和 `PlayAudio`，并通过 `QQueue<AVPacket *>` 接收 `Widget` 分发的音频包。
 
@@ -533,11 +571,11 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 对队列中尚未解码的所有 `AVPacket` 调用 `av_packet_free()`。
 
-## 11. `Widget`：播放器控制类
+## 12. `Widget`：播放器控制类
 
 ### 职责
 
-`Widget` 是播放管线的控制中心，负责对象生命周期、定时调度和数据分发。它持有一个 `MyDemux`、视频 `MyDecode`、`audioThread`、可复用视频 `AVFrame` 和 `videoOpenGLWidget`。
+`Widget` 是播放管线的控制中心，负责对象生命周期、定时调度和数据包分发。它持有一个 `MyDemux`、`videoThread`、`audioThread` 和 `videoOpenGLWidget`，不再直接执行音视频解码。
 
 ### 函数
 
@@ -545,12 +583,12 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 1. 初始化 Designer UI。
 2. 创建垂直布局和 `videoOpenGLWidget`。
-3. 分配可重复使用的 `AVFrame`。
-4. 将高精度 `QTimer::timeout` 连接到 `decodeNextFrame()`。
+3. 将 `videoThread::frameReady` 以队列连接方式连接到渲染控件。
+4. 将高精度 `QTimer::timeout` 连接到 `dispatchNextPackets()`。
 
 #### `~Widget()`
 
-停止播放，释放 `AVFrame`，再释放 Designer UI。
+停止音视频线程、关闭解封装器，再释放 Designer UI。
 
 #### `bool openMedia(const QString &fileName)`
 
@@ -559,34 +597,28 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 1. 调用 `stopPlayback()` 清理上一个文件。
 2. 将 Qt 字符串转为 UTF-8 路径。
 3. 使用 `MyDemux::open()` 打开媒体。
-4. 取得视频编码参数并打开视频 `MyDecode`。
+4. 取得视频编码参数并启动 `videoThread`。
 5. 取得音频编码参数并启动 `audioThread`；音频失败不阻止视频播放。
 6. 读取视频帧率并计算定时器间隔。
-7. 更新窗口标题、启动定时器并立即解码第一帧。
+7. 更新窗口标题、启动数据包定时器并立即分发第一批数据。
 
 成功返回 `true`，打开或初始化解码器失败时返回 `false`。
 
-#### `void decodeNextFrame()`
+#### `void dispatchNextPackets()`
 
-定时器驱动的核心解码函数：
+定时器驱动的数据包分发函数：
 
-1. 先调用 `receiveFrame()`，取走解码器中已经存在的输出。
-2. 若返回 `EAGAIN`，循环读取媒体包。
-3. 将音频包的所有权交给 `audioThread::pushPacket()`，丢弃其他未处理流。
-4. 将视频包传给 `sendPacket()` 并释放包。
-5. 再次调用 `receiveFrame()` 获取画面。
-6. 得到画面后调用 `presentFrame()`。
-7. 文件结束时分别通知视频解码器和音频线程进入 drain。
+1. 循环调用 `MyDemux::read()`。
+2. 将音频包交给 `audioThread::pushPacket()`。
+3. 将视频包交给 `videoThread::pushPacket()`，然后结束本次调用。
+4. 释放字幕等未处理的数据包。
+5. 文件结束时停止定时器，并调用两个线程的 `finishPackets()`。
 
 单次调用最多检查 256 个包，以免解封装工作长时间占用 GUI 线程。
 
-#### `bool presentFrame()`
-
-调用 `m_videoWidget->setFrame(m_videoFrame)`。渲染器完成数据复制后，立即调用 `av_frame_unref()` 释放当前帧引用，以便同一个 `AVFrame` 接收下一帧。
-
 #### `void stopPlayback()`
 
-停止视频定时器和音频线程、重置 drain 状态、清理当前 `AVFrame`、关闭解码器和解封装器，并清除渲染画面。
+停止数据包定时器，依次停止视频、音频线程，关闭解封装器并清除渲染画面。
 
 ### 成员关系
 
@@ -595,13 +627,11 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 | `ui` | `Widget` 创建并在析构函数中删除 |
 | `m_videoWidget` | 以 `Widget` 为 Qt parent，由 Qt 父子对象机制销毁 |
 | `m_demux` | 值成员，生命周期与 `Widget` 相同 |
-| `m_videoDecoder` | 值成员，生命周期与 `Widget` 相同 |
+| `m_videoThread` | 值成员，内部持有视频解码器和视频包队列 |
 | `m_audioThread` | 值成员，内部持有音频解码器、重采样器、播放设备和音频包队列 |
-| `m_videoFrame` | 构造时 `av_frame_alloc()`，析构时 `av_frame_free()` |
-| `m_decodeTimer` | 值成员，通过 Qt 事件循环驱动解码 |
-| `m_draining` | 标记是否已经向解码器发送文件结束信号 |
+| `m_packetTimer` | 值成员，通过 Qt 事件循环控制解封装和数据包分发节奏 |
 
-## 12. `main.cpp`：程序入口
+## 13. `main.cpp`：程序入口
 
 `main()` 完成以下工作：
 
@@ -618,35 +648,35 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 .\MyPlay2.exe "D:\video\sample.mp4"
 ```
 
-## 13. 关键对象的所有权
+## 14. 关键对象的所有权
 
 | 对象 | 创建位置 | 释放位置 |
 | --- | --- | --- |
 | `AVFormatContext` | `avformat_open_input()` | `MyDemux::close()` |
 | 视频/音频 `AVCodecParameters` | `MyDemux` 参数接口 | 对应的 `MyDecode::open()` |
 | `AVCodecContext` | `MyDecode::open()` | `MyDecode::close()` |
-| 视频 `AVPacket` | `MyDemux::read()` | `Widget::decodeNextFrame()` |
+| 视频 `AVPacket` | `MyDemux::read()` | `videoThread::run()` 或 `clearPackets()` |
 | 音频 `AVPacket` | `MyDemux::read()` | `audioThread::run()` 或 `clearPackets()` |
-| 视频 `AVFrame` | `Widget` 构造函数 | `Widget` 析构函数 |
+| 视频 `AVFrame` | `videoThread::run()` | 同一个 `run()` 退出前 |
 | 音频 `AVFrame` | `audioThread::run()` | 同一个 `run()` 退出前 |
-| 帧中的数据引用 | `MyDecode::receiveFrame()` | 每次 `presentFrame()` 后 `av_frame_unref()` |
-| CPU YUV 副本 | `videoOpenGLWidget::setFrame()` | 下一帧覆盖或 `clearFrame()` |
+| 帧中的数据引用 | `MyDecode::receiveFrame()` | 对应线程处理完每帧后 `av_frame_unref()` |
+| CPU YUV 副本 | `videoThread::copyYuv420pFrame()` | Qt 隐式共享引用全部释放后 |
 | OpenGL 资源 | `initializeGL()` / `ensureYuvTextures()` | `cleanupOpenGL()` |
 | `SwrContext` | `AudioResample::configure()` | `AudioResample::close()` |
 | `QAudioOutput` / `PlayAudio` | `audioThread::run()` | 同一个 `run()` 退出前 |
 
-## 14. 当前限制
+## 15. 当前限制
 
 - 只渲染 `AV_PIX_FMT_YUV420P`，不支持 NV12、YUV422P、YUV444P、RGB 和硬件帧。
 - 片元着色器当前使用视频范围的 YUV 到 RGB 系数，未根据 `AVFrame::color_range` 和 `colorspace` 动态选择色彩矩阵。
 - 已实现音频播放，但尚未实现音画同步。
-- 音频包队列当前没有容量上限。
-- 解封装和解码仍在 GUI 线程中执行，处理高码率视频或网络流时可能阻塞界面。
+- 音视频包队列当前都没有容量上限。
+- 音视频解码已经进入工作线程，但解封装仍由 GUI 定时器执行，网络流可能阻塞界面。
 - 播放节奏按照容器推测的平均帧率驱动，没有依据每帧 PTS 调度。
 - 尚未实现暂停、继续、进度条、seek 后解码状态重置、循环播放和音画同步。
 - `MyDemux::read()` 目前无法区分正常 EOF 与读取错误。
 
-## 15. 构建环境
+## 16. 构建环境
 
 当前项目配置使用：
 
@@ -665,11 +695,11 @@ D:\qt\Tools\mingw730_64\bin\mingw32-make.exe -j4
 
 运行时需要保证 Qt 和 FFmpeg 的 DLL 可以被系统找到。通过 Qt Creator 启动时通常会自动加入 Qt DLL 路径；FFmpeg 的 `bin` 目录需要加入运行环境的 `PATH`，或者将所需 DLL 部署到可执行文件目录。
 
-## 16. 后续扩展建议
+## 17. 后续扩展建议
 
 建议按照以下顺序继续开发：
 
-1. 将解封装和解码移动到独立线程，通过有界帧队列把视频帧交给 GUI 线程。
+1. 将解封装也移动到独立线程，并为音视频包队列增加容量和背压限制。
 2. 使用每帧 PTS 和流 `time_base` 进行播放调度。
 3. 增加暂停、继续和 seek；seek 后同时调用 `MyDemux::clear()` 与 `MyDecode::clear()`。
 4. 以音频设备播放时间作为主时钟实现音画同步。

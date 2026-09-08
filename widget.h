@@ -1,14 +1,13 @@
 #ifndef WIDGET_H
 #define WIDGET_H
 
-#include "mydecode.h"
-#include "mydemux.h"
 #include "audiothread.h"
+#include "mydemux.h"
+#include "videothread.h"
 
 #include <QTimer>
 #include <QWidget>
 
-struct AVFrame;
 class videoOpenGLWidget;
 
 QT_BEGIN_NAMESPACE
@@ -23,29 +22,22 @@ public:
     explicit Widget(QWidget *parent = nullptr);
     ~Widget() override;
 
-    // 打开媒体文件并启动视频解码。成功后由定时器持续拉取视频帧。
+    // 打开媒体文件，初始化音视频线程并启动数据包分发定时器。
     bool openMedia(const QString &fileName);
 
 private slots:
-    void decodeNextFrame();
+    // 从唯一的解封装器读取数据包，并按流类型交给对应工作线程。
+    void dispatchNextPackets();
 
 private:
-    // 停止定时器并释放解码器、解封装器中与当前文件有关的状态。
     void stopPlayback();
-
-    // 将 m_videoFrame 交给渲染器；渲染器复制数据后立即解引用该帧。
-    bool presentFrame();
 
     Ui::Widget *ui = nullptr;
     videoOpenGLWidget *m_videoWidget = nullptr;
     MyDemux m_demux;
-    MyDecode m_videoDecoder;
-    // 音频包由 Widget 分发给该线程，线程内完成解码、重采样和播放。
+    videoThread m_videoThread;
     audioThread m_audioThread;
-    AVFrame *m_videoFrame = nullptr;
-    QTimer m_decodeTimer;
-    // 到达文件尾后只向解码器发送一次空包，用来取出内部缓存的延迟帧。
-    bool m_draining = false;
+    QTimer m_packetTimer;
 };
 
 #endif // WIDGET_H

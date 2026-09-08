@@ -2,13 +2,6 @@
 
 #include <QDebug>
 #include <QMutexLocker>
-#include <QThread>
-#include <cstring>
-
-extern "C" {
-#include <libavutil/frame.h>
-#include <libavutil/pixfmt.h>
-}
 
 namespace {
 
@@ -63,63 +56,30 @@ videoOpenGLWidget::~videoOpenGLWidget()
     cleanupOpenGL();
 }
 
-bool videoOpenGLWidget::setFrame(const AVFrame *frame)
+bool videoOpenGLWidget::setFrame(const QByteArray &frameData,
+                                 int width,
+                                 int height)
 {
-    // AVFrame 仍属于解码器，先检查最基本的帧信息再读取其数据。
-    if (!frame || frame->width <= 0 || frame->height <= 0 ||
-        !frame->data[0] || !frame->data[1] || !frame->data[2]) {
+    if (width <= 0 || height <= 0)
         return false;
-    }
 
-    // 当前阶段只处理三平面的 YUV420P，其他像素格式不做隐式转换。
-    if (frame->format != AV_PIX_FMT_YUV420P) {
-        qWarning() << "videoOpenGLWidget only supports AV_PIX_FMT_YUV420P, got:"
-                   << frame->format;
-        return false;
-    }
-
-    const int width = frame->width;
-    const int height = frame->height;
-    // YUV420P 的色度分辨率是亮度分辨率的一半；向上取整可兼容奇数尺寸。
     const int chromaWidth = (width + 1) / 2;
     const int chromaHeight = (height + 1) / 2;
     const int ySize = width * height;
     const int chromaSize = chromaWidth * chromaHeight;
-    QByteArray copiedFrame(ySize + 2 * chromaSize, Qt::Uninitialized);
-
-    // AVFrame 的每行可能含有对齐填充，不能假设 linesize 等于画面宽度。
-    // 逐行复制后，缓存中三个平面都是紧密排列的连续数据。
-    char *dstPlanes[3] = {
-        copiedFrame.data(),
-        copiedFrame.data() + ySize,
-        copiedFrame.data() + ySize + chromaSize
-    };
-    const int rowBytes[3] = {width, chromaWidth, chromaWidth};
-    const int planeRows[3] = {height, chromaHeight, chromaHeight};
-    for (int plane = 0; plane < 3; ++plane) {
-        for (int row = 0; row < planeRows[plane]; ++row) {
-            std::memcpy(dstPlanes[plane] + row * rowBytes[plane],
-                        frame->data[plane] + row * frame->linesize[plane],
-                        static_cast<size_t>(rowBytes[plane]));
-        }
-    }
+    if (frameData.size() < ySize + 2 * chromaSize)
+        return false;
 
     {
         QMutexLocker locker(&m_frameMutex);
-        // 从这里开始，渲染器拥有独立副本，不再依赖传入 AVFrame 的生命周期。
-        m_frameData.swap(copiedFrame);
+        // QByteArray 使用隐式共享，赋值不会立即复制整帧内存。
+        m_frameData = frameData;
         m_frameWidth = width;
         m_frameHeight = height;
         m_frameDirty = true;
     }
 
-    // QWidget 只能在 GUI 线程请求刷新。当前实现从 GUI 定时器调用，
-    // 同时保留从独立解码线程投递帧的能力。
-    if (QThread::currentThread() == thread()) {
-        update();
-    } else {
-        QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
-    }
+    update();
     return true;
 }
 

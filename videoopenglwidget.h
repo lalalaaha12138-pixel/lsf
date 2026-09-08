@@ -6,9 +6,7 @@
 #include <QOpenGLFunctions_3_3_Core>
 #include <QOpenGLWidget>
 
-struct AVFrame;
-
-// 视频画面渲染控件：接收 FFmpeg 解码后的 YUV420P AVFrame，
+// 视频画面渲染控件：接收视频线程复制好的 YUV420P 数据，
 // 将 Y、U、V 三个平面上传到 OpenGL 纹理中完成显示。
 class videoOpenGLWidget : public QOpenGLWidget,
                           protected QOpenGLFunctions_3_3_Core
@@ -19,9 +17,8 @@ public:
     explicit videoOpenGLWidget(QWidget *parent = nullptr);
     ~videoOpenGLWidget() override;
 
-    // 当前只接受 AV_PIX_FMT_YUV420P。控件会在函数内复制帧数据，
-    // 因此函数返回后调用方可以立即复用或释放 frame。
-    bool setFrame(const AVFrame *frame);
+    // frameData 必须按 Y + U + V 顺序紧密排列。
+    bool setFrame(const QByteArray &frameData, int width, int height);
 
     // 清除当前缓存的画面，下一次绘制时只显示背景色。
     void clearFrame();
@@ -49,7 +46,7 @@ private:
     GLuint m_vboTextureUv = 0;
     GLuint m_textures[3] = {0, 0, 0};
 
-    // setFrame 将来可以由解码线程调用，因此帧缓存需要加锁保护。
+    // 帧通过 Qt 队列信号进入 GUI 线程；锁同时保护 paintGL 的缓存快照。
     QMutex m_frameMutex;
     QByteArray m_frameData;
     int m_frameWidth = 0;

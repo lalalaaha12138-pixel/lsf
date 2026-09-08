@@ -35,6 +35,7 @@ SOURCES += \
     mydecode.cpp \
     mydemux.cpp \
     playaudio.cpp \
+    videothread.cpp \
     videoopenglwidget.cpp \
     widget.cpp
 
@@ -44,6 +45,7 @@ HEADERS += \
     mydecode.h \
     mydemux.h \
     playaudio.h \
+    videothread.h \
     videoopenglwidget.h \
     widget.h
 
