@@ -146,6 +146,11 @@ AVCodecParameters *MyDemux::getVideoParameters()
 
 AVCodecParameters *MyDemux::getAudioParametes()
 {
+    return getAudioParameters();
+}
+
+AVCodecParameters *MyDemux::getAudioParameters()
+{
     std::lock_guard<std::mutex> parameterLock(mtx_);
     if(!format || audioStream < 0)return nullptr;
     AVCodecParameters * pa = avcodec_parameters_alloc();
@@ -156,8 +161,6 @@ AVCodecParameters *MyDemux::getAudioParametes()
         return nullptr;
     }
     return pa;
-
-    //记得释放内存
 }
 
 double MyDemux::videoFrameRate()

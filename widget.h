@@ -3,6 +3,7 @@
 
 #include "mydecode.h"
 #include "mydemux.h"
+#include "audiothread.h"
 
 #include <QTimer>
 #include <QWidget>
@@ -39,6 +40,8 @@ private:
     videoOpenGLWidget *m_videoWidget = nullptr;
     MyDemux m_demux;
     MyDecode m_videoDecoder;
+    // 音频包由 Widget 分发给该线程，线程内完成解码、重采样和播放。
+    audioThread m_audioThread;
     AVFrame *m_videoFrame = nullptr;
     QTimer m_decodeTimer;
     // 到达文件尾后只向解码器发送一次空包，用来取出内部缓存的延迟帧。

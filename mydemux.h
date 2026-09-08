@@ -26,8 +26,10 @@ public:
     // 当前 MyDecode::open 会接管并释放它。
     virtual AVCodecParameters *getVideoParameters();
 
+    // 返回新分配的音频编码参数，所有权交给调用者。
+    virtual AVCodecParameters *getAudioParameters();
 
-
+    // 保留旧的拼写错误接口，避免已有调用代码失效。
     virtual AVCodecParameters *getAudioParametes();
 
     // 返回容器推测的视频帧率；无法确定时返回 0。

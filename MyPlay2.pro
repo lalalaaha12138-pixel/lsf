@@ -1,4 +1,4 @@
-QT       += core gui
+QT       += core gui multimedia
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -29,15 +29,21 @@ DEFINES += QT_DEPRECATED_WARNINGS
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
+    audioresample.cpp \
+    audiothread.cpp \
     main.cpp \
     mydecode.cpp \
     mydemux.cpp \
+    playaudio.cpp \
     videoopenglwidget.cpp \
     widget.cpp
 
 HEADERS += \
+    audioresample.h \
+    audiothread.h \
     mydecode.h \
     mydemux.h \
+    playaudio.h \
     videoopenglwidget.h \
     widget.h
 

@@ -62,6 +62,11 @@ bool Widget::openMedia(const QString &fileName)
         return false;
     }
 
+    // 音频初始化失败不影响视频继续播放。
+    AVCodecParameters *audioParameters = m_demux.getAudioParameters();
+    if (audioParameters && !m_audioThread.open(audioParameters))
+        qWarning() << "Cannot open the audio decoder";
+
     // 以视频流帧率驱动解码定时器；容器没有帧率信息时回退到约 30 fps。
     const double frameRate = m_demux.videoFrameRate();
     const int interval = frameRate > 0.0
@@ -78,6 +83,7 @@ bool Widget::openMedia(const QString &fileName)
 void Widget::stopPlayback()
 {
     m_decodeTimer.stop();
+    m_audioThread.stopAudio();
     m_draining = false;
     if (m_videoFrame)
         av_frame_unref(m_videoFrame);
@@ -112,11 +118,12 @@ void Widget::decodeNextFrame()
         return;
     }
 
-    // 音频和字幕包目前直接跳过。每个定时器周期限制最多读取 256 个包，
-    // 防止损坏文件或长时间无视频包时阻塞 GUI 线程。
+    // 音频包转交给 audioThread，字幕等其他包直接跳过。每个定时器周期
+    // 限制最多读取 256 个包，防止长时间无视频包时阻塞 GUI 线程。
     for (int packetCount = 0; packetCount < 256; ++packetCount) {
         AVPacket *packet = m_demux.read();
         if (!packet) {
+            m_audioThread.finishPackets();
             // av_read_frame 返回空表示文件结束。发送空包通知解码器进入 drain，
             // H.264/H.265 等含 B 帧的编码可能仍有延迟帧需要取出。
             if (!m_draining) {
@@ -132,7 +139,13 @@ void Widget::decodeNextFrame()
             return;
         }
 
-        if (m_demux.packetType(packet) != MyDemux::PacketType::Video) {
+        const MyDemux::PacketType packetType = m_demux.packetType(packet);
+        if (packetType == MyDemux::PacketType::Audio) {
+            // pushPacket 接管 AVPacket，成功或失败都会负责释放。
+            m_audioThread.pushPacket(packet);
+            continue;
+        }
+        if (packetType != MyDemux::PacketType::Video) {
             av_packet_free(&packet);
             continue;
         }
