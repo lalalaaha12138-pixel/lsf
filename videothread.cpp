@@ -161,21 +161,28 @@ void videoThread::run()
             qWarning() << "Receiving a video frame failed:" << ret;
             break;
         }
-
+        //receiveFrame() 返回 EEAGAIN
+        //→如果缓存区中暂时没有完整输出帧
+        //→需要从包队列取 AVPacket，并并调用 sendPacket()
         AVPacket *packet = nullptr;
-        bool inputFinished = false;
+        bool inputFinished = false;//代表文件没有结束
         {
             QMutexLocker locker(&m_packetMutex);
             while (m_packets.isEmpty() && !m_inputFinished && !m_abort.load())
+                //解封装器返回 AVERROR_EOF
+                //说明不会再产生新的 AVPacket
+                //但必须先处理完 m_packets 中已有的包
+                //有包了||终止了就唤醒，没包阻塞
                 m_packetReady.wait(&m_packetMutex);
 
             if (m_abort.load())
                 break;
             if (!m_packets.isEmpty())
                 packet = m_packets.dequeue();
+            //更新是不是是真的文件结束了
             inputFinished = m_inputFinished && m_packets.isEmpty();
         }
-
+        //如果队列里每包了且是文件尾，send(nullptr),读取缓冲区最后的尾帧
         if (!packet && inputFinished) {
             if (!draining) {
                 m_decoder.sendPacket(nullptr);
@@ -188,6 +195,11 @@ void videoThread::run()
             continue;
 
         ret = m_decoder.sendPacket(packet);
+
+        //sendPacket() 返回醒EAGAIN
+        //说明包没有被接受
+        //需要把包放回队首
+        //先调用 receiveFrame() 取走解码器已有输出
         if (ret == AVERROR(EAGAIN)) {
             QMutexLocker locker(&m_packetMutex);
             m_packets.prepend(packet);
