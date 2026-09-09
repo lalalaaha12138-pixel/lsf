@@ -686,14 +686,24 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 - Qt Multimedia / `QAudioOutput`
 - OpenGL 3.3 Core Profile
 
-`MyPlay2.pro` 中的 `FFMPEG_ROOT` 必须指向本机 FFmpeg 开发包目录。构建命令示例：
+项目已把当前使用的 FFmpeg shared development package 放在 `third_party/ffmpeg`，默认直接使用该工程内相对路径，不需要在其他电脑上修改绝对路径。
+
+工程中保留以下覆盖方式，便于临时测试另一套 FFmpeg：
+
+1. 在 qmake 命令行中传入 `FFMPEG_ROOT`。
+2. 复制 `config.pri.example` 为 `config.pri`，然后填写本机路径。`config.pri` 已加入 `.gitignore`。
+3. 删除或移走工程内置依赖后，设置系统环境变量 `FFMPEG_ROOT`。
+
+`FFMPEG_ROOT` 应指向同时包含 `include`、`lib` 和 `bin` 目录的 FFmpeg shared development package。例如使用命令行配置：
 
 ```powershell
-D:\qt\5.12.8\mingw73_64\bin\qmake.exe D:\qt\code\MyPlay2\MyPlay2.pro -spec win32-g++ CONFIG+=debug
+D:\qt\5.12.8\mingw73_64\bin\qmake.exe D:\qt\code\MyPlay2\MyPlay2.pro -spec win32-g++ CONFIG+=debug FFMPEG_ROOT=D:/path/to/ffmpeg
 D:\qt\Tools\mingw730_64\bin\mingw32-make.exe -j4
 ```
 
-运行时需要保证 Qt 和 FFmpeg 的 DLL 可以被系统找到。通过 Qt Creator 启动时通常会自动加入 Qt DLL 路径；FFmpeg 的 `bin` 目录需要加入运行环境的 `PATH`，或者将所需 DLL 部署到可执行文件目录。
+每次链接成功后，qmake 会把 `avformat-63.dll`、`avcodec-63.dll`、`avutil-61.dll` 和 `swresample-7.dll` 自动复制到当前的 `debug` 或 `release` 输出目录。因此运行时不需要再把 FFmpeg 的 `bin` 目录加入系统 `PATH`。Qt 自身的 DLL 仍由 Qt Creator 的运行环境或 `windeployqt` 负责部署。
+
+工程没有带入 `ffmpeg.exe`、`ffplay.exe`、`ffprobe.exe` 和当前播放器未链接的滤镜等运行库。内置包的版本、内容和更新方法见 `third_party/ffmpeg/README.md`。FFmpeg DLL 由 Git LFS 管理，克隆项目的电脑需要安装 Git LFS 并执行 `git lfs pull`。
 
 ## 17. 后续扩展建议
 

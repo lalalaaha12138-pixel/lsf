@@ -3,10 +3,14 @@
 *.pro.user.*
 *.autosave
 
+# 本机依赖路径
+config.pri
+
 # qmake / 编译产物
 .qmake.stash
 Makefile
 Makefile.*
+object_script.*
 debug/
 release/
 build-*/
@@ -14,6 +18,9 @@ build-*/
 *.obj
 *.exe
 *.dll
+
+# 工程内置的 FFmpeg 运行库需要提交；实际大文件由 Git LFS 管理。
+!third_party/ffmpeg/bin/*.dll
 
 # Qt 自动生成文件
 ui_*.h

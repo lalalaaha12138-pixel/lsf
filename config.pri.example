@@ -1,0 +1,4 @@
+# 工程默认使用 third_party/ffmpeg，无需创建本文件。
+# 仅当需要切换到另一套 FFmpeg 时，才复制本文件为 config.pri 并修改路径。
+# 路径中建议使用正斜杠；不要把包含本机绝对路径的 config.pri 提交到 Git。
+FFMPEG_ROOT = C:/path/to/ffmpeg
