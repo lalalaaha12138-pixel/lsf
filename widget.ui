@@ -6,13 +6,450 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>800</width>
-    <height>600</height>
+    <width>960</width>
+    <height>640</height>
    </rect>
   </property>
-  <property name="windowTitle">
-   <string>Widget</string>
+  <property name="minimumSize">
+   <size>
+    <width>720</width>
+    <height>480</height>
+   </size>
   </property>
+  <property name="windowTitle">
+   <string>MyPlay2</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">QWidget#Widget {
+    background-color: #15171c;
+    color: #e9edf3;
+    font-family: &quot;Microsoft YaHei UI&quot;;
+    font-size: 13px;
+}
+
+QFrame#videoFrame {
+    background-color: #050607;
+    border: 1px solid #30343c;
+    border-radius: 10px;
+}
+
+QFrame#controlPanel {
+    background-color: #20232a;
+    border: 1px solid #30343c;
+    border-radius: 10px;
+}
+
+QLabel#appNameLabel {
+    color: #ffffff;
+    font-size: 20px;
+    font-weight: 600;
+}
+
+QLabel#mediaTitleLabel {
+    color: #aeb6c2;
+}
+
+QLabel#playbackStateLabel {
+    color: #72d7a7;
+    background-color: #19362c;
+    border: 1px solid #275744;
+    border-radius: 10px;
+    padding: 3px 10px;
+}
+
+QLabel#currentTimeLabel,
+QLabel#totalTimeLabel,
+QLabel#volumeLabel,
+QLabel#speedLabel {
+    color: #b9c0ca;
+}
+
+QPushButton {
+    min-height: 32px;
+    padding: 0 14px;
+    color: #edf1f7;
+    background-color: #30343d;
+    border: 1px solid #414753;
+    border-radius: 6px;
+}
+
+QPushButton:hover {
+    background-color: #3a404b;
+    border-color: #586171;
+}
+
+QPushButton:pressed {
+    background-color: #272b33;
+}
+
+QPushButton#playPauseButton {
+    color: #ffffff;
+    background-color: #3978f6;
+    border-color: #4b86fa;
+    font-weight: 600;
+}
+
+QPushButton#playPauseButton:hover {
+    background-color: #4a86fa;
+}
+
+QSlider::groove:horizontal {
+    height: 5px;
+    background-color: #414650;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background-color: #4a86fa;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    width: 14px;
+    margin: -5px 0;
+    background-color: #f4f7fb;
+    border: 2px solid #4a86fa;
+    border-radius: 7px;
+}
+
+QComboBox {
+    min-height: 30px;
+    min-width: 72px;
+    padding: 0 8px;
+    color: #edf1f7;
+    background-color: #30343d;
+    border: 1px solid #414753;
+    border-radius: 6px;
+}</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout" stretch="0,1,0">
+   <property name="spacing">
+    <number>10</number>
+   </property>
+   <property name="leftMargin">
+    <number>12</number>
+   </property>
+   <property name="topMargin">
+    <number>12</number>
+   </property>
+   <property name="rightMargin">
+    <number>12</number>
+   </property>
+   <property name="bottomMargin">
+    <number>12</number>
+   </property>
+   <item>
+    <layout class="QHBoxLayout" name="titleLayout">
+     <property name="spacing">
+      <number>10</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="appNameLabel">
+       <property name="text">
+        <string>MyPlay2</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="mediaTitleLabel">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="text">
+        <string>未选择媒体文件</string>
+       </property>
+       <property name="textFormat">
+        <enum>Qt::PlainText</enum>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignVCenter|Qt::AlignLeft</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="playbackStateLabel">
+       <property name="text">
+        <string>就绪</string>
+       </property>
+       <property name="alignment">
+        <set>Qt::AlignCenter</set>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QFrame" name="videoFrame">
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+       <horstretch>0</horstretch>
+       <verstretch>1</verstretch>
+      </sizepolicy>
+     </property>
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>320</height>
+      </size>
+     </property>
+     <property name="frameShape">
+      <enum>QFrame::StyledPanel</enum>
+     </property>
+     <layout class="QVBoxLayout" name="videoLayout">
+      <property name="spacing">
+       <number>0</number>
+      </property>
+      <property name="leftMargin">
+       <number>1</number>
+      </property>
+      <property name="topMargin">
+       <number>1</number>
+      </property>
+      <property name="rightMargin">
+       <number>1</number>
+      </property>
+      <property name="bottomMargin">
+       <number>1</number>
+      </property>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QFrame" name="controlPanel">
+     <property name="frameShape">
+      <enum>QFrame::StyledPanel</enum>
+     </property>
+     <layout class="QVBoxLayout" name="controlPanelLayout">
+      <property name="spacing">
+       <number>9</number>
+      </property>
+      <property name="leftMargin">
+       <number>14</number>
+      </property>
+      <property name="topMargin">
+       <number>12</number>
+      </property>
+      <property name="rightMargin">
+       <number>14</number>
+      </property>
+      <property name="bottomMargin">
+       <number>12</number>
+      </property>
+      <item>
+       <layout class="QHBoxLayout" name="progressLayout">
+        <property name="spacing">
+         <number>10</number>
+        </property>
+        <item>
+         <widget class="QLabel" name="currentTimeLabel">
+          <property name="minimumSize">
+           <size>
+            <width>48</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>00:00</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QSlider" name="positionSlider">
+          <property name="toolTip">
+           <string>播放进度</string>
+          </property>
+          <property name="maximum">
+           <number>1000</number>
+          </property>
+          <property name="pageStep">
+           <number>10</number>
+          </property>
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="totalTimeLabel">
+          <property name="minimumSize">
+           <size>
+            <width>48</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="text">
+           <string>00:00</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="playbackControlsLayout">
+        <property name="spacing">
+         <number>8</number>
+        </property>
+        <item>
+         <widget class="QPushButton" name="openButton">
+          <property name="toolTip">
+           <string>选择媒体文件</string>
+          </property>
+          <property name="text">
+           <string>打开</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="rewindButton">
+          <property name="toolTip">
+           <string>后退 10 秒</string>
+          </property>
+          <property name="text">
+           <string>-10 秒</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="playPauseButton">
+          <property name="minimumSize">
+           <size>
+            <width>86</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="toolTip">
+           <string>播放或暂停</string>
+          </property>
+          <property name="text">
+           <string>播放</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="stopButton">
+          <property name="toolTip">
+           <string>停止播放</string>
+          </property>
+          <property name="text">
+           <string>停止</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="forwardButton">
+          <property name="toolTip">
+           <string>前进 10 秒</string>
+          </property>
+          <property name="text">
+           <string>+10 秒</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="controlsSpacer">
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>24</width>
+            <height>20</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item>
+         <widget class="QLabel" name="volumeLabel">
+          <property name="text">
+           <string>音量</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QSlider" name="volumeSlider">
+          <property name="minimumSize">
+           <size>
+            <width>100</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>140</width>
+            <height>16777215</height>
+           </size>
+          </property>
+          <property name="toolTip">
+           <string>音量</string>
+          </property>
+          <property name="maximum">
+           <number>100</number>
+          </property>
+          <property name="value">
+           <number>80</number>
+          </property>
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="speedLabel">
+          <property name="text">
+           <string>倍速</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="speedComboBox">
+          <property name="toolTip">
+           <string>播放速度</string>
+          </property>
+          <property name="currentIndex">
+           <number>1</number>
+          </property>
+          <item>
+           <property name="text">
+            <string>0.5x</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>1.0x</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>1.25x</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>1.5x</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>2.0x</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+  </layout>
  </widget>
  <resources/>
  <connections/>

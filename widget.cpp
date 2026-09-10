@@ -5,7 +5,6 @@
 
 #include <QDebug>
 #include <QFileInfo>
-#include <QVBoxLayout>
 #include <QtGlobal>
 
 extern "C" {
@@ -19,10 +18,10 @@ Widget::Widget(QWidget *parent)
 {
     ui->setupUi(this);
 
-    auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    m_videoWidget = new videoOpenGLWidget(this);
-    layout->addWidget(m_videoWidget);
+    // Designer 文件负责整个窗口布局，这里只把真正的 OpenGL 渲染控件
+    // 放入预留的视频区域。下方控制按钮目前只完成界面，不连接播放逻辑。
+    m_videoWidget = new videoOpenGLWidget(ui->videoFrame);
+    ui->videoLayout->addWidget(m_videoWidget);
 
     // videoThread 发出的是独立 QByteArray，排队到 GUI 线程后再更新渲染缓存。
     connect(&m_videoThread, &videoThread::frameReady,
