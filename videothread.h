@@ -79,6 +79,9 @@ private:
 
     // open() 在线程启动前写入，run() 中只读。
     AVRational m_timeBase{0, 1};
+
+
+    //把主线程里的audioThread 地址传给videoThread
     const audioThread *m_audioClockSource = nullptr;
 
     // 没有可用音频时钟时，以第一帧视频 PTS 为起点自行控制播放速度。

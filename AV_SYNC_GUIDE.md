@@ -1,213 +1,153 @@
-# MyPlay2 音视频同步详解
+# MyPlay2 音视频同步完整调用逻辑
 
-## 1. 文档目标
+## 1. 先看最核心的具体逻辑
 
-本文结合 MyPlay2 当前代码，详细解释“视频同步音频”的实现。这里的“视频同步音频”是指：
-
-```text
-音频作为主时钟
-视频根据自己与音频的时间差决定等待、显示或丢帧
-```
-
-本文适合已经了解基本 C++ 语法，但尚未系统学习 C++ 内存模型和播放器时钟的读者。重点回答以下问题：
-
-- PTS 和时间基为什么必须一起使用？
-- 音频时钟具体从哪里来？
-- 为什么不能用“写入声卡的字节数”直接代表播放进度？
-- 视频提前和视频落后时分别怎么处理？
-- 为什么音频时钟需要原子变量？
-- `std::memory_order_release` 与 `std::memory_order_acquire` 有什么作用？
-- `acquire/release` 能保证什么，又不能保证什么？
-- 没有音频或没有有效 PTS 时如何回退？
-
-相关代码：
-
-- [`mydemux.cpp`](mydemux.cpp)：取得音频、视频流时间基。
-- [`mydecode.cpp`](mydecode.cpp)：给解码器设置压缩包时间基。
-- [`audiothread.cpp`](audiothread.cpp)：建立并发布音频主时钟。
-- [`videothread.cpp`](videothread.cpp)：等待、显示或丢弃视频帧。
-- [`widget.cpp`](widget.cpp)：启动音视频线程、快速投包并实施队列背压。
-
-## 2. 为什么播放器需要同步
-
-音频和视频是两个独立的数据流：
+MyPlay2 采用“音频作为主时钟，视频同步音频”的方案。整个同步过程分成前后两个阶段：
 
 ```text
-音频包 → 音频解码器 → PCM → 声卡
-视频包 → 视频解码器 → YUV → OpenGL
+阶段一：audioThread 建立并发布音频时钟
+
+音频 AVFrame
+  → AudioResample::convert() 生成声卡格式 PCM
+  → audioThread::tryStartClock() 建立媒体时间原点
+  → audioThread::writePcm() 写入 QAudioOutput
+  → audioThread::refreshClock() 发布三个原子变量
+
+阶段二：videoThread 读取音频时钟并处理视频帧
+
+视频 AVFrame
+  → videoThread::synchronizeFrame()
+  → frameTimestampUs() 取得视频时间
+  → audioThread::clockUs() 取得音频时间
+  → videoPtsUs - audioClockUs
+       正数：视频提前，等待
+       接近 0：正常显示
+       小于负阈值：视频落后，丢帧
 ```
 
-两条路径的耗时不同：
-
-- 音频和视频编码复杂度不同。
-- 解码一个视频帧通常比解码一个音频帧耗时更多。
-- 声卡内部存在播放缓冲区。
-- 视频要经过线程信号、GUI 事件队列和 OpenGL 绘制。
-- 操作系统线程调度会产生抖动。
-
-如果两个线程只按照“解码完成就立即播放”的方式运行，常见结果是：
-
-```text
-声音已经到第 10 秒，画面还停在第 9.8 秒
-```
-
-或者：
-
-```text
-画面已经到第 10 秒，声音只播放到第 9.9 秒
-```
-
-因此播放器需要一个共同的时间轴，并选择一个主时钟。
-
-## 3. 当前采用的同步策略
-
-MyPlay2 使用音频作为主时钟：
-
-```text
-               ┌──────────────────────┐
-音频 AVFrame → │ AudioResample        │
-               └──────────┬───────────┘
-                          ↓ PCM
-               ┌──────────────────────┐
-               │ QAudioOutput         │
-               └──────────┬───────────┘
-                          ↓ processedUSecs()
-                   发布 audioClock
-                          ↓
-视频 AVFrame → videoPts - audioClock
-                          │
-              ┌───────────┼───────────┐
-              ↓           ↓           ↓
-          视频提前     时间接近     视频落后
-            等待         显示         丢帧
-```
-
-选择音频为主时钟的主要原因是：
-
-- 声卡会按照固定采样率连续消费 PCM。
-- 频繁中断、插入或删除音频很容易产生爆音。
-- 人耳对音频不连续非常敏感。
-- 视频可以通过等待或丢帧较自然地调整进度。
-
-## 4. PTS 与时间基
-
-### 4.1 PTS 不是秒
-
-`AVFrame::pts` 是显示时间戳，但它只是一个整数刻度：
+最关键的调用是：
 
 ```cpp
-int64_t pts;
+qint64 audioClockUs = m_audioClockSource->clockUs();
 ```
 
-实际时间由 PTS 和时间基共同决定：
+`clockUs()` 表示：
+
+```text
+当前音频估计已经播放到媒体时间轴的哪个位置
+```
+
+例如返回 `2128000` 微秒，表示音频大约播放到媒体第 `2.128` 秒。
+
+便于记忆的近似公式：
+
+```text
+当前音频时间 ≈
+    音频帧 PTS
+    + QAudioOutput 实际处理时长
+    + 两次采样之间经过的单调时间
+```
+
+项目实际使用的完整公式：
+
+```text
+音频时间原点 =
+    第一个有效音频帧 PTS
+    - 此前已经提交的 PCM 时长
+
+最近一次音频时钟采样 =
+    音频时间原点
+    + QAudioOutput::processedUSecs()
+
+videoThread 读取到的音频时钟 =
+    min(
+        最近一次音频时钟采样 + 距离采样经过的单调时间,
+        已经提交的 PCM 结束时间
+    )
+```
+
+## 2. Widget 怎样让 videoThread 知道 audioThread
+
+### 2.1 Widget 同时持有两个线程对象
+
+[`widget.h`](widget.h) 中：
+
+```cpp
+videoThread m_videoThread;
+audioThread m_audioThread;
+```
+
+`Widget` 是协调者。它先启动音频线程：
+
+```cpp
+audioStarted = m_audioThread.open(
+    audioParameters,
+    m_demux.audioTimeBase());
+```
+
+再把音频线程对象的地址交给视频线程：
+
+```cpp
+m_videoThread.open(
+    videoParameters,
+    m_demux.videoTimeBase(),
+    audioStarted ? &m_audioThread : nullptr);
+```
+
+`videoThread::open()` 保存这个地址：
+
+```cpp
+m_audioClockSource = audioClockSource;
+```
+
+因此后面可以调用：
+
+```cpp
+m_audioClockSource->clockUs();
+```
+
+这里没有复制新的 `audioThread`，只是保存 `Widget::m_audioThread` 的指针。如果音频启动失败，就传入 `nullptr`，视频改用自身时钟。
+
+停止播放时先停止视频，再停止音频：
+
+```cpp
+m_videoThread.stopVideo();
+m_audioThread.stopAudio();
+```
+
+这样能保证视频线程停止读取音频时钟后，音频线程才停止。
+
+## 3. PTS 和时间基怎样进入线程
+
+PTS 本身只是整数刻度：
 
 ```text
 实际时间（秒） = PTS × time_base
 ```
 
-FFmpeg 使用 `AVRational` 表示时间基：
+例如时间基 `{1, 8000}` 表示一个刻度为 `1/8000` 秒。PTS 为 `16000` 时：
+
+```text
+16000 × 1/8000 = 2 秒
+```
+
+[`MyDemux::audioTimeBase()`](mydemux.cpp) 和 `videoTimeBase()` 分别返回对应的：
 
 ```cpp
-typedef struct AVRational {
-    int num;
-    int den;
-} AVRational;
+format->streams[streamIndex]->time_base;
 ```
 
-时间基 `{1, 8000}` 表示：
+音频和视频时间基通常不同，不能直接比较两者的原始 PTS。
 
-```text
-一个 PTS 刻度 = 1 / 8000 秒
-              = 0.000125 秒
-              = 125 微秒
-```
-
-如果：
-
-```text
-PTS = 16000
-```
-
-那么：
-
-```text
-实际时间 = 16000 × 1/8000 = 2 秒
-```
-
-### 4.2 音频和视频的时间基通常不同
-
-例如：
-
-```text
-音频时间基 = {1, 48000}
-音频 PTS   = 96000
-
-视频时间基 = {1, 90000}
-视频 PTS   = 180000
-```
-
-原始数值分别是 `96000` 和 `180000`，不能直接比较。但换算后：
-
-```text
-音频时间 = 96000  × 1/48000 = 2 秒
-视频时间 = 180000 × 1/90000 = 2 秒
-```
-
-它们实际位于同一时刻。
-
-因此下面的代码是错误的：
-
-```cpp
-if (videoFrame->pts > audioFrame->pts) {
-    // 错误：两个 PTS 的单位可能不同。
-}
-```
-
-### 4.3 MyDemux 提供时间基
-
-当前项目从每个 `AVStream` 中取得时间基：
-
-```cpp
-AVRational MyDemux::videoTimeBase()
-{
-    return format->streams[videoStream]->time_base;
-}
-
-AVRational MyDemux::audioTimeBase()
-{
-    return format->streams[audioStream]->time_base;
-}
-```
-
-`Widget::openMedia()` 将它们分别传给音频和视频线程：
-
-```cpp
-m_audioThread.open(audioParameters, m_demux.audioTimeBase());
-
-m_videoThread.open(videoParameters,
-                   m_demux.videoTimeBase(),
-                   &m_audioThread);
-```
-
-### 4.4 为什么还要设置 `AVCodecContext::pkt_timebase`
-
-解码器收到的 `AVPacket::pts` 和 `AVPacket::dts` 使用流时间基。当前代码在 `MyDecode::open()` 中设置：
+[`MyDecode::open()`](mydecode.cpp) 还会设置：
 
 ```cpp
 codecCtx->pkt_timebase = packetTimeBase;
 ```
 
-这样 FFmpeg 才知道压缩包时间戳的单位，并能更可靠地为解码帧推导 `best_effort_timestamp`。
+这样 FFmpeg 才知道输入 `AVPacket::pts/dts` 的单位，并能正确推导解码帧的 `best_effort_timestamp`。
 
-### 4.5 统一换算成微秒
-
-项目使用 FFmpeg 通用微秒时间基：
-
-```text
-AV_TIME_BASE_Q = {1, 1000000}
-```
-
-换算方法：
+项目把音频和视频时间都统一换算成微秒：
 
 ```cpp
 qint64 ptsUs = av_rescale_q(
@@ -216,59 +156,76 @@ qint64 ptsUs = av_rescale_q(
     AV_TIME_BASE_Q);
 ```
 
-换算后音频和视频都以微秒为单位：
+其中：
 
 ```text
-1000 微秒      = 1 毫秒
-1000000 微秒   = 1 秒
+AV_TIME_BASE_Q = {1, 1000000}
 ```
 
-此时才能安全计算：
-
-```cpp
-qint64 differenceUs = videoPtsUs - audioClockUs;
-```
-
-## 5. 音频时钟由什么组成
-
-音频时钟不是简单读取一个 PTS。当前实现由以下几部分共同组成：
+## 4. 阶段一：音频时钟完整调用链
 
 ```text
-媒体时间原点
-    + 声卡已经处理的时间
-    + 距离最近一次采样经过的单调时间
+audioThread::run()
+  → MyDecode::receiveFrame(frame)
+  → AudioResample::convert(frame, outputFormat, &pcmData)
+  → audioThread::tryStartClock(frame)
+  → audioThread::writePcm(pcmData)
+       → PlayAudio::write()
+       → m_submittedBytes += written
+       → audioThread::refreshClock()
+            → submittedDurationUs()
+            → QAudioOutput::processedUSecs()
+            → steadyClockUs()
+            → store() 发布三个原子变量
+
+videoThread 需要时：
+  → audioThread::clockUs()
+       → load() 读取三个原子变量
+       → steadyClockUs() 计算采样后经过时间
+       → qMin() 限制不能超过 PCM 末尾
 ```
 
-同时还必须满足：
+## 5. `audioThread::run()`：取得音频帧
+
+[`audioThread::run()`](audiothread.cpp) 首先调用：
+
+```cpp
+int ret = m_decoder.receiveFrame(frame);
+```
+
+返回 `0` 表示成功取得一帧解码音频，随后执行：
+
+```cpp
+QByteArray pcmData;
+if (m_resample.convert(frame,
+                       m_playAudio->format(),
+                       &pcmData)) {
+    tryStartClock(frame);
+    writePcm(pcmData);
+}
+```
+
+真实顺序是：
 
 ```text
-音频时钟不能超过已经提交给声卡的 PCM 末尾
+重采样成功
+  → 尝试建立时钟
+  → 写入 PCM
 ```
 
-相关成员位于 `audioThread`：
+只有生成了可播放 PCM 才启动音频时钟。否则重采样失败时，视频可能等待一个根本不会前进的时钟。
 
-```cpp
-std::atomic<qint64> m_clockUs;
-std::atomic<qint64> m_clockUpdatedSteadyUs;
-std::atomic<qint64> m_submittedEndUs;
+## 6. `AudioResample::convert()`：生成声卡格式 PCM
 
-AVRational m_timeBase;
-qint64 m_clockOriginUs;
-qint64 m_submittedBytes;
-bool m_clockStarted;
-```
+解码器输出可能是 44100 Hz、FLTP 平面浮点音频，而 `QAudioOutput` 可能要求 48000 Hz、S16 交错音频。
 
-前三个原子变量会被视频线程读取；后四个普通成员只在音频工作线程中使用。
+`AudioResample::convert()` 使用 `swr_convert()` 完成采样率、采样格式和声道布局转换，最终生成 `QByteArray pcmData`。
 
-## 6. `tryStartClock()`：建立媒体时间原点
+同步时统计的是重采样后真正成功写入声卡的字节数，不能使用解码帧原始字节数。
 
-第一次成功生成可播放 PCM 后，音频线程调用：
+## 7. `tryStartClock()`：建立音频时间原点
 
-```cpp
-tryStartClock(frame);
-```
-
-### 6.1 选择时间戳
+### 7.1 选择时间戳
 
 ```cpp
 int64_t timestamp = frame->best_effort_timestamp;
@@ -276,16 +233,14 @@ if (timestamp == AV_NOPTS_VALUE)
     timestamp = frame->pts;
 ```
 
-优先使用 `best_effort_timestamp`，是因为 FFmpeg 会利用现有 PTS、DTS 和解码信息推测较适合播放的时间戳。
-
-如果两个时间戳都等于 `AV_NOPTS_VALUE`，说明无法把声卡播放进度映射到媒体时间轴，暂时不启动音频同步时钟：
+优先使用 `best_effort_timestamp`，缺失时退回 `pts`。如果两者都无效，音频仍可播放，但暂时无法建立同步时钟：
 
 ```cpp
 if (timestamp == AV_NOPTS_VALUE)
     return;
 ```
 
-### 6.2 换算成微秒
+### 7.2 换算成微秒
 
 ```cpp
 const qint64 framePtsUs = av_rescale_q(
@@ -294,132 +249,151 @@ const qint64 framePtsUs = av_rescale_q(
     AV_TIME_BASE_Q);
 ```
 
-### 6.3 为什么要减去已经提交的时长
+### 7.3 计算音频时间原点
 
 ```cpp
-m_clockOriginUs = framePtsUs - submittedDurationUs();
+m_clockOriginUs =
+    framePtsUs - submittedDurationUs();
 ```
 
-通常第一帧就有有效 PTS，此时已经提交的时长是 0：
+通常第一帧就有 PTS：
 
 ```text
-clockOrigin = firstFramePts
+framePtsUs          = 2.000 秒
+此前提交 PCM 时长   = 0 秒
+clockOriginUs       = 2.000 秒
 ```
 
-但也可能前几个音频帧没有 PTS，已经写入了一部分 PCM，后面的帧才出现有效时间戳。
-
-例如：
+如果已经播放了 0.5 秒没有 PTS 的音频，当前帧 PTS 才第一次有效：
 
 ```text
-当前有效帧 PTS           = 2.500 秒
-此前已经提交 PCM 时长    = 0.500 秒
+当前 framePtsUs     = 2.500 秒
+此前提交 PCM 时长   = 0.500 秒
+clockOriginUs       = 2.000 秒
 ```
 
-声卡从启动到当前帧之间已经有 0.5 秒数据，因此声卡起点应对应：
+这样 `QAudioOutput` 从启动时的第 0 秒能映射到媒体第 2 秒。
 
-```text
-clockOrigin = 2.500 - 0.500 = 2.000 秒
-```
-
-## 7. `submittedDurationUs()`：字节数怎样变成时长
-
-`m_submittedBytes` 记录成功写入 `QAudioOutput` 的 PCM 字节数：
+最后设置：
 
 ```cpp
+m_clockStarted = true;
+refreshClock();
+```
+
+## 8. `writePcm()`：写声卡并统计提交量
+
+`writePcm()` 循环调用：
+
+```cpp
+const qint64 written = m_playAudio->write(
+    pcmData.constData() + offset,
+    pcmData.size() - offset);
+```
+
+成功写入时：
+
+```cpp
+offset += written;
 m_submittedBytes += written;
+refreshClock();
 ```
 
-以 48 kHz、双声道、16 位 PCM 为例：
+`m_submittedBytes` 表示本次播放累计向设备提交了多少 PCM。
 
-```text
-每个声道样本字节数 = 16 / 8 = 2 字节
-一个 sample frame   = 2 字节 × 2 声道 = 4 字节
-```
-
-如果已经写入 `192000` 字节：
-
-```text
-sample frame 数量 = 192000 / 4 = 48000
-持续时间          = 48000 / 48000 = 1 秒
-```
-
-对应代码：
+设备缓冲区满时，`PlayAudio::write()` 返回 `0`：
 
 ```cpp
-const int bytesPerSample = outputFormat.sampleSize() / 8;
+if (written == 0) {
+    refreshClock();
+    QThread::msleep(5);
+    continue;
+}
+```
+
+虽然没有写入新数据，但声卡仍在后台消费已有 PCM，所以继续刷新播放时钟，并休眠 5 ms 避免空转。
+
+注意：写入成功只表示 PCM 进入设备缓冲区，不代表用户已经听到全部数据。
+
+## 9. `submittedDurationUs()`：PCM 字节数换成时长
+
+假设输出格式是 48000 Hz、双声道、16 bit：
+
+```text
+bytesPerSample = 16 / 8 = 2 字节
+bytesPerFrame  = 2 字节 × 2 声道 = 4 字节
+```
+
+代码：
+
+```cpp
+const int bytesPerSample =
+    outputFormat.sampleSize() / 8;
+
 const int bytesPerFrame =
     bytesPerSample * outputFormat.channelCount();
 
 const qint64 submittedSamples =
     m_submittedBytes / bytesPerFrame;
 
-return av_rescale(submittedSamples,
-                  AV_TIME_BASE,
-                  outputFormat.sampleRate());
+return av_rescale(
+    submittedSamples,
+    AV_TIME_BASE,
+    outputFormat.sampleRate());
 ```
 
-这里的 `submittedSamples` 表示 sample frame 数量，不需要再乘声道数。
-
-## 8. `refreshClock()`：从声卡采样播放进度
-
-### 8.1 为什么不能只看写入量
-
-调用：
-
-```cpp
-m_device->write(data, size);
-```
-
-成功只表示 PCM 已经进入 `QAudioOutput` 缓冲区，不代表用户已经听到了这些数据。
-
-假设一次写入了 200 ms PCM：
+例如提交 `192000` 字节：
 
 ```text
-已经写入设备：200 ms
-真正经过声卡处理：20 ms
-仍在设备中排队：180 ms
+sample frame 数 = 192000 / 4 = 48000
+持续时间         = 48000 / 48000 = 1 秒
 ```
 
-如果把“已经写入 200 ms”当作“已经播放 200 ms”，视频会提前约 180 ms。
+这个时长表示已经提交 PCM 的范围上限，不等于声卡已经播放的时长。
 
-### 8.2 使用 `processedUSecs()`
+## 10. `refreshClock()`：产生三个原子变量
 
-当前实现使用：
-
-```cpp
-m_playAudio->processedUSecs()
-```
-
-它表示 `QAudioOutput` 从 `start()` 以后已经处理的音频时长。于是媒体时间为：
+### 10.1 取得 QAudioOutput 实际处理时长
 
 ```cpp
 qint64 playedUs =
-    m_clockOriginUs + m_playAudio->processedUSecs();
+    m_clockOriginUs
+    + m_playAudio->processedUSecs();
 ```
+
+`processedUSecs()` 表示 `QAudioOutput` 从 `start()` 以来已经处理的 PCM 时长。
 
 例如：
 
 ```text
-媒体时间原点        = 2.000 秒
-声卡已经处理        = 0.120 秒
-音频媒体时钟        = 2.120 秒
+clockOriginUs      = 2.000 秒
+processedUSecs()   = 0.120 秒
+playedUs           = 2.120 秒
 ```
 
-`processedUSecs()` 是 Qt 音频后端提供的估算值，比“已写入字节数”更接近实际播放位置，但不应理解为扬声器振膜级别的绝对精确测量。
+它比已写入字节数更接近用户听到的位置，但仍是 Qt 音频后端提供的估计。
 
-### 8.3 限制不能超过已提交 PCM 末尾
+### 10.2 计算已提交 PCM 的末尾
 
 ```cpp
 const qint64 submittedEndUs =
     m_clockOriginUs + submittedDurationUs();
+```
 
+假设已经提交 0.2 秒 PCM：
+
+```text
+submittedEndUs = 2.000 + 0.200 = 2.200 秒
+```
+
+限制声卡时间不能超过它：
+
+```cpp
 if (playedUs > submittedEndUs)
     playedUs = submittedEndUs;
 ```
 
-如果只向声卡提交到媒体第 2.2 秒，音频时钟就不能超过 2.2 秒。
-
-### 8.4 发布一次时钟快照
+### 10.3 发布三个原子变量
 
 ```cpp
 m_submittedEndUs.store(
@@ -435,50 +409,60 @@ m_clockUs.store(
     std::memory_order_release);
 ```
 
-三个值分别表示：
+| 原子变量 | 含义 |
+| --- | --- |
+| `m_clockUs` | 最近一次从声卡采样得到的媒体音频位置 |
+| `m_clockUpdatedSteadyUs` | 进行这次采样时的单调时钟时间点 |
+| `m_submittedEndUs` | 已提交 PCM 在媒体时间轴上的末尾 |
 
-```text
-m_submittedEndUs          已提交 PCM 的媒体时间末尾
-m_clockUpdatedSteadyUs    采样 processedUSecs() 时的单调时钟
-m_clockUs                 最近一次采样得到的媒体音频时钟
+## 11. `steadyClockUs()`：记录时间点而不是函数开销
+
+```cpp
+qint64 audioThread::steadyClockUs()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now()
+            .time_since_epoch()).count();
+}
 ```
 
-## 9. `clockUs()`：视频线程如何取得当前音频时间
+它返回单调时钟的当前时间点，不是在测量函数本身运行多久。
 
-视频线程不能直接调用音频线程中的 `QAudioOutput`，否则会违反 Qt 对象的线程归属规则。因此它只读取音频线程发布的原子数据。
+第一次调用：
 
-### 9.1 读取最近一次快照
+```text
+sampledAtUs = 50000000
+```
+
+中间可能经历解码、睡眠、阻塞和线程调度共 20 ms。第二次调用：
+
+```text
+nowUs = 50020000
+elapsedUs = 50020000 - 50000000 = 20 ms
+```
+
+这 20 ms 包含两个时间点之间所有真实经过时间。`steady_clock` 不受修改系统日期、时区和网络校时影响，适合测量播放器经过时长。
+
+## 12. `clockUs()`：videoThread 最终取得音频时间
+
+[`audioThread::clockUs()`](audiothread.cpp) 首先读取三个原子变量：
 
 ```cpp
 const qint64 sampledClockUs =
     m_clockUs.load(std::memory_order_acquire);
 
 const qint64 sampledAtUs =
-    m_clockUpdatedSteadyUs.load(std::memory_order_acquire);
+    m_clockUpdatedSteadyUs.load(
+        std::memory_order_acquire);
 
 const qint64 submittedEndUs =
-    m_submittedEndUs.load(std::memory_order_acquire);
+    m_submittedEndUs.load(
+        std::memory_order_acquire);
 ```
 
-如果时钟尚未建立或已经停止，返回：
+如果时钟尚未建立或已经停止，返回 `audioThread::InvalidClockUs`。它使用 `qint64` 最小值，因为合法媒体 PTS 可能为负数，不能简单用 `-1` 表示无效。
 
-```cpp
-audioThread::InvalidClockUs
-```
-
-它使用 `qint64` 的最小值，而不是 `-1`，因为媒体 PTS 允许为负数，`-1` 微秒理论上可能是合法媒体时间。
-
-### 9.2 为什么还需要单调时钟推算
-
-音频线程不会在每一微秒都调用 `processedUSecs()`。如果视频线程只能得到上一次采样值，音频时钟会呈阶梯状跳动。
-
-因此记录采样时的单调时钟：
-
-```cpp
-m_clockUpdatedSteadyUs
-```
-
-视频线程读取时计算距离上次采样经过了多久：
+计算距离最近采样经过的时间：
 
 ```cpp
 const qint64 elapsedUs = qMax<qint64>(
@@ -486,36 +470,33 @@ const qint64 elapsedUs = qMax<qint64>(
     steadyClockUs() - sampledAtUs);
 ```
 
-然后推算：
+最终返回：
 
 ```cpp
-sampledClockUs + elapsedUs
+return qMin(
+    sampledClockUs + elapsedUs,
+    submittedEndUs);
 ```
 
-最后仍然限制到 PCM 末尾：
-
-```cpp
-return qMin(sampledClockUs + elapsedUs,
-            submittedEndUs);
-```
-
-### 9.3 为什么使用 `steady_clock`
-
-`std::chrono::steady_clock` 是单调时钟：
+例如：
 
 ```text
-只会向前走，不会因为用户修改系统时间、网络校时或时区变化而突然跳动
+最近采样音频时间   = 2.120 秒
+采样后又经过       = 0.008 秒
+推算结果           = 2.128 秒
+已提交 PCM 末尾    = 2.200 秒
+最终返回           = 2.128 秒
 ```
 
-播放器测量两个时刻之间经过了多久，应使用单调时钟，而不是系统日期时间。
+如果只提交到 2.125 秒，最终返回会被限制为 2.125 秒。
 
-## 10. 为什么需要 `std::atomic`
+## 13. 为什么这里需要 `std::atomic`
 
-### 10.1 当前存在两个真正并行的线程
+现在有两个真正并行的线程：
 
 ```text
-audioThread::run()  写入音频时钟
-videoThread::run()  读取音频时钟
+audioThread::run()  写三个时钟变量
+videoThread::run()  通过 clockUs() 读取三个时钟变量
 ```
 
 如果使用普通变量：
@@ -524,15 +505,14 @@ videoThread::run()  读取音频时钟
 qint64 m_clockUs;
 ```
 
-音频线程写入的同时，视频线程可能正在读取。这在 C++ 中叫 data race（数据竞争）。
+一个线程写、另一个线程同时读，会形成 data race（数据竞争）。C++ 中的数据竞争属于未定义行为，不只是“偶尔读到旧值”。
 
-数据竞争不是简单的“偶尔读到旧值”，而是未定义行为。编译器可以基于“程序不存在数据竞争”的假设进行优化，最终可能出现：
+可能表现为：
 
-- 读到意料之外的值。
-- 长时间看不到另一个线程的更新。
-- 在某些架构上读到撕裂值。
 - Debug 正常而 Release 异常。
-- 程序表现无法可靠推理。
+- 视频线程长时间看不到新值。
+- 某些架构读取到不完整数值。
+- 编译器基于“程序没有数据竞争”的假设进行意外优化。
 
 使用：
 
@@ -540,307 +520,354 @@ qint64 m_clockUs;
 std::atomic<qint64>
 ```
 
-能够保证每次 `load()` 和 `store()` 都是原子操作，不会与另一个线程的原子访问形成数据竞争。
+可以保证单次 `load()` 和 `store()` 是原子访问，不会与另一个线程的原子访问形成数据竞争。
 
-### 10.2 `volatile` 不能代替 `atomic`
+`volatile` 不能代替 `atomic`。`volatile` 主要用于硬件寄存器等场景，不会建立 C++ 线程之间的同步关系。
 
-下面的写法不能解决线程同步：
+## 14. 为什么 store 使用 `memory_order_release`
 
-```cpp
-volatile qint64 m_clockUs;
-```
-
-`volatile` 主要用于内存映射硬件寄存器等场景。它不能建立 C++ 线程间的同步关系，也不能保证复合的跨线程读写安全。
-
-## 11. C++ 内存顺序入门
-
-原子操作除了操作本身，还可以指定 memory order（内存顺序）。常见选项有：
-
-| 内存顺序 | 简化理解 |
-| --- | --- |
-| `memory_order_relaxed` | 只保证当前原子变量读写不可撕裂，不负责发布其他数据 |
-| `memory_order_release` | 用于发布；它之前的操作不能被挪到发布之后 |
-| `memory_order_acquire` | 用于接收；它之后的操作不能被挪到接收之前 |
-| `memory_order_acq_rel` | 同一个读改写操作同时承担 acquire 和 release |
-| `memory_order_seq_cst` | 最强的顺序，额外提供所有此类操作的全局单一顺序 |
-
-如果不写内存顺序：
+音频线程发布快照时：
 
 ```cpp
-m_abort.store(true);
-m_abort.load();
-```
-
-默认使用 `memory_order_seq_cst`。
-
-## 12. `release/acquire` 到底解决什么问题
-
-### 12.1 先看一个普通数据发布例子
-
-假设线程 A 准备数据：
-
-```cpp
-payload = 123;
-ready.store(true, std::memory_order_release);
-```
-
-线程 B 接收数据：
-
-```cpp
-if (ready.load(std::memory_order_acquire)) {
-    use(payload);
-}
-```
-
-当线程 B 的 acquire 读到了线程 A release 写入的 `true`，就建立了同步关系：
-
-```text
-线程 A 中 release 之前的写入
-        happens-before
-线程 B 中 acquire 之后的读取
-```
-
-可以把它理解为：
-
-```text
-release：数据准备好了，现在正式发布
-acquire：我确认看到了这次发布，现在可以读取配套数据
-```
-
-### 12.2 为什么 CPU 或编译器会调整顺序
-
-为了提高性能，编译器和 CPU 可能在不影响单线程结果的前提下重新安排指令、缓存写入和读取。
-
-单线程观察：
-
-```cpp
-data = 100;
-ready = true;
-```
-
-看起来一定先写 `data`，再写 `ready`。但跨线程观察时，如果没有同步约束，另一个线程不应假定两个写入一定按照源码顺序可见。
-
-release/acquire 就是用来建立这种跨线程的可见性和先后关系。
-
-## 13. 当前音频时钟为什么使用 release
-
-音频线程发布一次时钟快照时，按照以下顺序写入：
-
-```cpp
-// 配套数据先写。
+// 先准备配套数据。
 m_submittedEndUs.store(endUs,
                        std::memory_order_release);
 m_clockUpdatedSteadyUs.store(nowUs,
                              std::memory_order_release);
 
-// 基础音频时钟最后发布。
+// 最后发布主要的音频时钟值。
 m_clockUs.store(playedUs,
                 std::memory_order_release);
 ```
 
-可以把 `m_clockUs` 理解成“这次快照已经发布”的主要标志：
+`release` 可以简化理解为：
 
 ```text
-先准备：PCM 末尾、采样时刻
-最后发布：采样得到的音频时钟
+我之前准备的数据已经完成，现在正式发布给其他线程
 ```
 
-`release` 阻止这些准备工作在内存模型中被重排到最终发布之后。
+这里先发布 PCM 末尾和采样时刻，最后发布采样音频时钟。`release` 约束它之前的操作，防止它们在跨线程可见性意义上被移动到发布之后。
 
-## 14. 当前视频线程为什么使用 acquire
+## 15. 为什么 load 使用 `memory_order_acquire`
 
-读取端首先读取基础音频时钟：
+视频线程通过 `clockUs()` 首先读取：
 
 ```cpp
 const qint64 sampledClockUs =
     m_clockUs.load(std::memory_order_acquire);
 ```
 
-如果这个 acquire 读到了音频线程某次 release 发布的值，那么发布之前的配套更新会对当前线程可见。
-
-随后读取：
-
-```cpp
-m_clockUpdatedSteadyUs.load(std::memory_order_acquire);
-m_submittedEndUs.load(std::memory_order_acquire);
-```
-
-当前实现对三个原子读取都使用 acquire，写入都使用 release。这是一种偏保守、便于初学者理解的写法。
-
-理论上可以进一步缩小屏障范围，例如：
-
-```cpp
-// 写入端：配套字段先 relaxed 写入，最后 release 发布主字段。
-end.store(value, std::memory_order_relaxed);
-updatedAt.store(now, std::memory_order_relaxed);
-clock.store(current, std::memory_order_release);
-
-// 读取端：先 acquire 主字段，再 relaxed 读取配套字段。
-auto current = clock.load(std::memory_order_acquire);
-auto now = updatedAt.load(std::memory_order_relaxed);
-auto limit = end.load(std::memory_order_relaxed);
-```
-
-但这种写法对存储顺序和读取顺序要求更严格。当前代码优先保持可读性，没有采用更激进的内存顺序优化。
-
-## 15. acquire/release 不能保证什么
-
-### 15.1 它不是互斥锁
-
-`acquire/release` 不会阻止音频线程继续更新，也不会让视频线程独占这些变量。
-
-### 15.2 多个原子变量不是数据库事务
-
-三个独立原子变量不会自动变成一个不可分割的整体。视频线程可能在音频线程两次刷新之间读取：
+`acquire` 可以简化理解为：
 
 ```text
-某个字段来自第 N 次刷新
-另一个字段已经来自第 N+1 次刷新
+我已经接收到写线程的发布，现在读取这次发布对应的数据
 ```
 
-当前代码通过“先写上限和采样时刻，最后发布基础时钟”以及末尾上限约束，让读取结果保持保守和可用。这里允许极短时间内出现少量估算误差，因为同步阈值本来就是毫秒级。
+如果 acquire 读取到了音频线程某次 release 发布的值，就建立：
 
-如果以后要求三个字段必须来自完全相同的一次快照，可以选择：
+```text
+音频线程 release 之前的操作
+        happens-before
+视频线程 acquire 之后的操作
+```
 
-1. 使用 `QMutex` 保护一个包含三个字段的结构体；
-2. 使用版本号实现 sequence lock；
-3. 将需要的信息压缩成一个可原子交换的数据表示。
+当前实现对三个原子读取都使用 acquire，三个写入都使用 release。这是一种偏保守、便于理解的写法。
 
-对于初学者，互斥锁版本通常最容易验证正确性。原子方案适合频繁读取、允许小幅估算误差且不希望视频线程等待锁的时钟数据。
+### 15.1 为什么不直接全部改成 relaxed
 
-### 15.3 原子类型不一定真正 lock-free
+`memory_order_relaxed` 只保证当前原子变量自身的读写不可撕裂，不负责把它作为其他数据的发布和接收点。
 
-`std::atomic<T>` 保证原子语义，但 C++ 标准不保证所有平台上的所有 `T` 都一定通过无锁 CPU 指令实现。
+如果三个操作随意改成 relaxed，虽然单个原子仍没有数据竞争，但不能继续依赖“先准备配套值，最后发布主时钟”的跨线程顺序语义。
 
-可以查询：
+### 15.2 为什么不用默认 seq_cst
+
+不指定内存顺序时默认是 `memory_order_seq_cst`：
+
+```cpp
+m_abort.store(true);
+m_abort.load();
+```
+
+`seq_cst` 更强，还为所有同类操作提供统一的全局顺序。当前音频时钟只有发布者和读取者，需要的是发布/接收关系，所以 acquire/release 已经足够，也更明确地表达代码意图。
+
+### 15.3 三个原子变量不是一个事务
+
+三个原子仍然是三个独立对象。视频线程可能恰好遇到音频线程刷新，读到相邻两次刷新中的字段。
+
+当前代码通过“先写上限和采样时刻，最后发布基础时钟”以及 `submittedEndUs` 上限，使结果保持保守可用。同步阈值是毫秒级，因此允许极小的估算误差。
+
+如果以后要求三个字段必须来自完全相同的一次快照，可以使用 `QMutex` 保护一个结构体：
+
+```cpp
+struct AudioClockSnapshot
+{
+    qint64 clockUs;
+    qint64 sampledAtUs;
+    qint64 submittedEndUs;
+};
+```
+
+也可以使用版本号实现 sequence lock，但对当前学习阶段没有必要。
+
+### 15.4 atomic 不一定等于底层无锁
+
+`std::atomic<T>` 保证原子语义，但标准不保证所有平台上的所有 `T` 都通过无锁 CPU 指令实现。
+
+可以检查：
 
 ```cpp
 m_clockUs.is_lock_free();
 ```
 
-在当前 64 位平台上，64 位整数通常能够高效原子访问，但代码不应把“atomic”与“标准保证 lock-free”画等号。
+当前 64 位平台通常能高效处理 64 位整数原子操作，但代码不应把 `atomic` 和“标准保证 lock-free”画等号。
 
-## 16. `synchronizeFrame()`：视频如何同步音频
+## 16. 阶段二：videoThread 处理视频帧的完整调用链
 
-视频线程每解码出一帧，先执行：
+```text
+videoThread::run()
+  → MyDecode::receiveFrame(frame)
+  → videoThread::synchronizeFrame(frame)
+       → frameTimestampUs(frame)
+            将视频 PTS 换算成微秒
+       → m_audioClockSource->clockUs()
+            取得当前音频媒体时间
+       → differenceUs = videoPtsUs - audioClockUs
+            视频提前：循环等待
+            视频落后：返回 Drop
+            时间接近：返回 Present
+            收到停止：返回 Abort
 
-```cpp
-const SyncDecision decision = synchronizeFrame(frame);
+run() 根据结果继续：
+  Present → copyYuv420pFrame() → emit frameReady()
+  Drop    → av_frame_unref()，不发送画面
+  Abort   → av_frame_unref()，退出线程
 ```
 
-返回值：
+## 17. `videoThread::run()`：视频处理入口
+
+[`videoThread::run()`](videothread.cpp) 调用：
 
 ```cpp
-enum class SyncDecision {
-    Present,  // 显示
-    Drop,     // 丢帧
-    Abort     // 停止线程
+int ret = m_decoder.receiveFrame(frame);
+```
+
+返回 `0` 表示成功得到视频帧，随后调用：
+
+```cpp
+const SyncDecision decision =
+    synchronizeFrame(frame);
+```
+
+返回类型：
+
+```cpp
+enum class SyncDecision
+{
+    Present,
+    Drop,
+    Abort
 };
 ```
 
-### 16.1 取得视频时间
+这样把“时间同步决策”和“真正复制、显示画面”分开。
+
+## 18. `frameTimestampUs()`：取得视频帧媒体时间
+
+先取得适合显示顺序的时间戳：
 
 ```cpp
-const qint64 videoPtsUs = frameTimestampUs(frame);
+int64_t timestamp = frame->best_effort_timestamp;
+if (timestamp == AV_NOPTS_VALUE)
+    timestamp = frame->pts;
 ```
 
-`frameTimestampUs()` 同样优先使用 `best_effort_timestamp`，然后使用 `pts`，最后通过视频流时间基换算成微秒。
+存在 B 帧时，解码顺序可能不同于显示顺序，因此不能直接使用 `pkt_dts` 控制画面显示。
 
-没有时间戳时无法同步：
+再用视频流时间基换算成微秒：
 
 ```cpp
-if (videoPtsUs == AV_NOPTS_VALUE)
-    return SyncDecision::Present;
+return av_rescale_q(
+    timestamp,
+    m_timeBase,
+    AV_TIME_BASE_Q);
 ```
 
-### 16.2 计算时间差
+如果没有有效时间戳，返回 `AV_NOPTS_VALUE`。`synchronizeFrame()` 无法判断它应该什么时候显示，只能返回 `Present`。
+
+## 19. `synchronizeFrame()`：连接前后两个阶段
+
+### 19.1 取得视频时间
 
 ```cpp
-qint64 differenceUs = videoPtsUs - audioClockUs;
+const qint64 videoPtsUs =
+    frameTimestampUs(frame);
 ```
 
-符号含义必须记清楚：
+### 19.2 调用 clockUs() 取得音频时间
+
+```cpp
+qint64 audioClockUs = m_audioClockSource
+    ? m_audioClockSource->clockUs()
+    : audioThread::InvalidClockUs;
+```
+
+这就是两个阶段的连接点：
 
 ```text
-differenceUs > 0  视频 PTS 更大，视频跑到音频前面，需要等待
-differenceUs = 0  音视频位于同一媒体时间
-differenceUs < 0  视频落后于音频，需要立即显示或丢帧
+audioThread 发布三个原子变量
+  → clockUs() 计算当前音频媒体时间
+  → videoThread 取得 audioClockUs
+  → synchronizeFrame() 处理视频帧
 ```
 
-### 16.3 视频提前：分段等待
+### 19.3 计算差值
+
+```cpp
+qint64 differenceUs =
+    videoPtsUs - audioClockUs;
+```
+
+| `differenceUs` | 含义 | 处理 |
+| ---: | --- | --- |
+| 大于 0 | 视频时间更大，视频提前 | 等待 |
+| 接近 0 | 音视频接近 | 显示 |
+| 小于 0 | 视频时间更小，视频落后 | 立即显示或丢帧 |
+
+## 20. 视频提前时怎样等待
+
+假设：
+
+```text
+videoPtsUs    = 2.180 秒
+audioClockUs  = 2.128 秒
+differenceUs  = +52 ms
+```
+
+视频提前，需要等待：
 
 ```cpp
 while (differenceUs > 2000 && !m_abort.load()) {
     QThread::msleep(sleepMs);
+
     audioClockUs = m_audioClockSource->clockUs();
     differenceUs = videoPtsUs - audioClockUs;
 }
 ```
 
-`2000` 微秒是 2 ms 容差。线程调度和声卡时间本身就存在误差，没有必要为了最后几微秒忙等。
+调用过程：
 
-每次最多睡眠 10 ms，而不是一次睡完整个差值，原因是：
+```text
+synchronizeFrame()
+  → 判断 differenceUs > 2000 微秒
+  → QThread::msleep()，每次最多等待 10 ms
+  → audioThread::clockUs() 重新取得最新音频时间
+  → 重新计算 differenceUs
+  → 继续等待或返回 Present
+```
 
-- 音频时钟还在前进，需要重新读取。
-- 用户可能随时停止或切换文件。
-- 一次睡眠过长容易因为调度误差睡过头。
-- 音频可能在等待期间结束或失效。
+每次最多等待 10 ms，是为了持续更新音频时钟、及时响应停止，并避免一次睡眠过长造成过冲。
 
-### 16.4 视频落后：丢帧
+`2000` 微秒是 2 ms 容差。线程调度和音频后端都存在误差，没有必要忙等最后几微秒。
+
+## 21. 视频落后时怎样丢帧
+
+先估计一帧持续时间：
+
+```cpp
+qint64 frameDurationUs = 40000;
+
+if (frame->duration > 0) {
+    frameDurationUs = av_rescale_q(
+        frame->duration,
+        m_timeBase,
+        AV_TIME_BASE_Q);
+}
+```
+
+默认 `40000` 微秒，即 40 ms，对应约 25 FPS。
+
+迟到阈值限制到 20~100 ms：
+
+```cpp
+const qint64 lateThresholdUs = qBound<qint64>(
+    20000,
+    qAbs(frameDurationUs),
+    100000);
+```
+
+这样能避免异常 `duration` 导致轻微抖动就丢帧，或者严重落后仍不丢帧。
+
+判断：
 
 ```cpp
 if (differenceUs < -lateThresholdUs)
     return SyncDecision::Drop;
 ```
 
-迟到阈值优先使用当前视频帧的持续时间：
-
-```cpp
-frameDurationUs = av_rescale_q(
-    frame->duration,
-    m_timeBase,
-    AV_TIME_BASE_Q);
-```
-
-再限制到 20~100 ms：
-
-```cpp
-lateThresholdUs = qBound<qint64>(
-    20000,
-    qAbs(frameDurationUs),
-    100000);
-```
-
-这样可以避免异常 `duration` 导致轻微抖动就丢帧，或者已经严重落后仍不丢帧。
-
-`Drop` 后不会复制 YUV 数据，也不会向 GUI 发送信号，而是立即处理下一帧：
+例如：
 
 ```text
-丢掉过时画面 → 继续解码 → 再次比较 → 直到追上音频
+audioClockUs       = 2.128 秒
+videoPtsUs         = 2.070 秒
+differenceUs       = -58 ms
+lateThresholdUs    = 40 ms
 ```
 
-### 16.5 停止：及时返回 Abort
+因为 `-58 ms < -40 ms`，当前帧已经明显过时，返回 `Drop`。
 
-等待循环不断检查：
+`run()` 随后只执行：
 
 ```cpp
-m_abort.load()
+av_frame_unref(frame);
 ```
 
-`m_abort` 是原子布尔值。当前没有显式指定内存顺序，因此使用默认的 `memory_order_seq_cst`。
+不会复制 YUV，也不会发送给 GUI，而是立即处理下一帧追赶音频。
 
-收到停止请求后返回 `Abort`，可以避免 `stopVideo()` 长时间等待工作线程退出。
+## 22. 正常显示时调用哪些函数
 
-## 17. 没有音频时的回退时钟
+当 `synchronizeFrame()` 返回 `Present`：
 
-以下情况可能没有有效音频时钟：
+```cpp
+QByteArray frameData;
+if (copyYuv420pFrame(frame, &frameData))
+    emit frameReady(frameData,
+                    frame->width,
+                    frame->height);
+```
+
+完整调用链：
+
+```text
+SyncDecision::Present
+  → copyYuv420pFrame()
+       按 linesize 逐行复制 Y、U、V
+  → QByteArray 独立保存紧密 YUV420P
+  → emit frameReady()
+  → Qt::QueuedConnection
+  → GUI 线程中的 lambda
+  → videoOpenGLWidget::setFrame()
+  → update()
+  → paintGL()
+```
+
+必须复制 YUV 数据，因为随后会调用：
+
+```cpp
+av_frame_unref(frame);
+```
+
+如果把 `AVFrame::data[]` 原始指针直接交给 GUI，视频线程复用帧后，这些指针可能失效或指向新数据。
+
+## 23. 没有音频时怎样处理视频
+
+`clockUs()` 返回 `InvalidClockUs` 可能表示：
 
 - 文件没有音频流。
 - 音频设备打开失败。
 - 音频帧没有有效 PTS。
-- 音频播放已经结束，但视频还有尾部内容。
+- 音频已经播放结束。
 
-视频线程使用第一帧视频 PTS 和 `QElapsedTimer` 建立本地时钟：
+视频线程使用 `QElapsedTimer` 建立备用时钟：
 
 ```cpp
 if (!m_videoTimer.isValid()) {
@@ -862,189 +889,216 @@ const qint64 targetElapsedUs =
 m_videoTimer.nsecsElapsed() / 1000
 ```
 
-两者相减得到还需要等待多久。
+两者相减得到还需要等待多久。这样无音频视频也会按照自身 PTS 播放，而不是瞬间显示完整个文件。
 
-## 18. 为什么需要快速投包和队列背压
+## 24. 收到停止请求时怎样退出
 
-旧实现按照平均帧率，每个定时周期只投递一个视频包。如果视频已经落后并丢掉一帧，下一包仍要等待完整帧周期，视频就很难真正追上音频。
+视频等待循环不断检查：
 
-当前改为：
-
-```text
-1 ms 定时器快速读取 packet
-        ↓
-视频队列最多 64 个包
-音频队列最多 256 个包
-        ↓
-任一队列满时暂停解封装
+```cpp
+m_abort.load()
 ```
 
-这样视频线程落后时可以连续取得多个帧并丢弃过时帧。同时队列容量防止把整个媒体文件一次性读进内存。
+当前没有指定内存顺序，所以这里默认使用 `memory_order_seq_cst`。
 
-当前背压按包数量计算。不同 packet 的字节大小可能相差很多，后续可以改为按队列总字节数限制。
+如果用户关闭窗口或切换文件，`stopVideo()` 设置退出标志并唤醒线程。`synchronizeFrame()` 返回 `Abort`，`run()` 释放当前帧并退出，避免停止操作长时间等待。
 
-## 19. 文件结束时的处理
+## 25. `waitForDeviceDrain()`：音频结束后为什么还要等
 
-文件结束包含三个不同层级：
+解码器 EOF 不表示声卡播放完成：
 
 ```text
 解封装器 EOF
-    ↓ 通知不再有 AVPacket
-解码器 drain
-    ↓ sendPacket(nullptr)，取出延迟帧
-重采样器和声卡缓冲
-    ↓ 播放剩余 PCM
-真正播放结束
+  → sendPacket(nullptr) 排空解码器
+  → 最后的 AVFrame 转换并写入 QAudioOutput
+  → 设备缓冲区可能仍有约 200 ms PCM
 ```
 
-音频线程在解码器返回 `AVERROR_EOF` 后调用：
+正常结束时调用：
 
 ```cpp
 waitForDeviceDrain();
 ```
 
-等待过程中继续刷新音频时钟，直到 `QAudioOutput` 进入 `IdleState`、`StoppedState`，或者达到保护性超时。
-
-最后把音频时钟设为无效：
+内部逻辑：
 
 ```cpp
-m_clockUs.store(InvalidClockUs,
-                std::memory_order_release);
+while (!m_abort.load() && timeout.elapsed() < 1000) {
+    refreshClock();
+
+    if (m_playAudio->state() == QAudio::IdleState ||
+        m_playAudio->state() == QAudio::StoppedState) {
+        break;
+    }
+
+    QThread::msleep(5);
+}
 ```
 
-这样如果视频比音频更长，视频会切换到自身 PTS 时钟，而不会永远等待停止在最后一个值的音频时钟。
+它负责：
 
-注意：当前 `AudioResample` 结束时还没有显式调用空输入排空 `SwrContext`，变采样率场景下理论上可能遗留少量尾部样本。它与解码器 drain、声卡 drain 是三个不同问题。
+- 等待设备消费尾部 PCM。
+- 等待期间继续刷新音频时钟。
+- 用户主动停止时立即结束。
+- 最多等待 1 秒，避免异常音频后端永久阻塞线程。
 
-## 20. 完整同步示例
+音频结束后把时钟设为无效。如果视频比音频更长，视频尾部会切换到自身 PTS 时钟。
 
-假设：
+需要区分三个排空层级：
 
 ```text
-音频第一帧媒体 PTS      = 2.000 秒
-QAudioOutput 已处理      = 0.120 秒
-距离最近采样又经过       = 0.008 秒
-已经提交的 PCM 末尾      = 2.200 秒
-当前视频帧 PTS           = 2.180 秒
+解码器 drain：sendPacket(nullptr)，取出延迟 AVFrame
+重采样器 drain：空输入 swr_convert()，取出延迟样本
+声卡 drain：waitForDeviceDrain()，等待已写 PCM 被消费
 ```
 
-音频时钟：
+当前项目尚未单独排空 `SwrContext`，变采样率时理论上可能遗留少量尾部样本。
 
-```text
-audioClock = 2.000 + 0.120 + 0.008
-           = 2.128 秒
-```
+## 26. 快速投包和队列背压为什么与同步有关
 
-没有超过 2.200 秒的 PCM 末尾，因此结果有效。
+旧方式如果每 40 ms 才给视频线程一个包，视频落后时即使丢掉一帧，也要再等 40 ms 才有下一包，很难连续追赶。
 
-视频差值：
-
-```text
-difference = 2.180 - 2.128
-           = +0.052 秒
-           = +52 ms
-```
-
-差值为正，说明视频早了 52 ms。视频线程分段等待，每次醒来重新读取音频时钟，接近目标时间后显示。
-
-另一个例子：
-
-```text
-audioClock = 2.128 秒
-videoPts   = 2.070 秒
-difference = -58 ms
-```
-
-假设当前帧迟到阈值为 40 ms：
-
-```text
--58 ms < -40 ms
-```
-
-返回 `Drop`，当前画面不显示，继续处理下一帧。
-
-## 21. 当前实现的边界与后续改进
-
-### 21.1 `processedUSecs()` 存在平台误差
-
-不同操作系统和音频后端对“已经处理”的统计精度可能不同。当前实现适合基础播放器，但不等于专业播放引擎的硬件时钟校准。
-
-### 21.2 GUI 渲染也可能产生延迟
-
-视频线程决定显示后，通过 Qt 队列信号把 `QByteArray` 发送到 GUI。如果 GUI 线程繁忙，待显示帧仍可能排队。
-
-后续可以让渲染控件只保留最新帧，避免 GUI 信号队列积压旧画面。
-
-### 21.3 暂停和 seek 尚未重置时钟
-
-增加暂停、继续和跳转时，需要同时处理：
-
-- 暂停或恢复 `QAudioOutput`。
-- 重置 `m_clockOriginUs` 和已提交时长。
-- 清空音视频包队列和解码器缓存。
-- 重置视频 `QElapsedTimer`。
-- 重新建立新的第一帧 PTS 基准。
-
-### 21.4 时间戳跳变
-
-网络流、拼接文件或损坏媒体可能出现 PTS 大幅跳变。当前代码没有专门检测 discontinuity。后续可以设置“不同步阈值”，时间差异常大时重建时钟，而不是长时间等待或连续丢帧。
-
-### 21.5 变速播放
-
-当前单调时钟默认按照 1.0 倍速度前进。倍速播放时，需要把经过时间乘以播放速度，并调整音频重采样或使用专门的变速不变调算法。
-
-## 22. 调试建议
-
-学习同步时，可以暂时每隔若干帧输出一次：
+当前 `Widget` 使用：
 
 ```cpp
-qDebug() << "video pts(ms):" << videoPtsUs / 1000.0
-         << "audio clock(ms):" << audioClockUs / 1000.0
-         << "difference(ms):" << differenceUs / 1000.0;
+m_packetTimer.start(1);
 ```
 
-不要每帧长期开启日志，因为控制台输出本身会影响线程调度和同步结果。
-
-重点观察：
+快速预读，同时限制：
 
 ```text
-正常播放：difference 在较小范围内波动
-视频提前：difference 为正，随后逐渐接近 0
-视频落后：difference 小于负阈值，出现 Drop
-音频无效：进入 QElapsedTimer 回退路径
+视频队列最多 64 个 packet
+音频队列最多 256 个 packet
 ```
 
-## 23. 推荐阅读代码顺序
+队列满时 `dispatchNextPackets()` 暂停读取，下一次定时器再尝试。这让视频线程可以连续解码和丢帧，又不会把整个文件一次性读进内存。
 
-1. `MyDemux::audioTimeBase()` 和 `videoTimeBase()`。
-2. `MyDecode::open()` 中的 `pkt_timebase`。
-3. `audioThread::submittedDurationUs()`。
-4. `audioThread::tryStartClock()`。
-5. `audioThread::refreshClock()`。
-6. `audioThread::clockUs()`。
-7. `videoThread::frameTimestampUs()`。
-8. `videoThread::synchronizeFrame()`。
-9. `Widget::dispatchNextPackets()` 的队列背压。
+## 27. 两个阶段调用的函数对照表
 
-## 24. 核心记忆
+### 27.1 音频时钟产生和读取
+
+| 顺序 | 函数 | 功能 |
+| ---: | --- | --- |
+| 1 | `MyDemux::audioTimeBase()` | 取得音频 PTS 的单位 |
+| 2 | `MyDecode::open()` | 设置 `pkt_timebase` 并打开解码器 |
+| 3 | `audioThread::run()` | 驱动音频解码循环 |
+| 4 | `MyDecode::receiveFrame()` | 取得音频 `AVFrame` |
+| 5 | `AudioResample::convert()` | 转换成声卡要求的 PCM |
+| 6 | `audioThread::tryStartClock()` | 用音频 PTS 建立媒体时间原点 |
+| 7 | `audioThread::writePcm()` | 分段写入声卡并累计成功字节数 |
+| 8 | `PlayAudio::write()` | 把 PCM 写入音频设备缓冲区 |
+| 9 | `submittedDurationUs()` | 把累计 PCM 字节换算成微秒 |
+| 10 | `QAudioOutput::processedUSecs()` | 取得设备已经处理的音频时长 |
+| 11 | `refreshClock()` | 计算并发布三个原子时钟值 |
+| 12 | `steadyClockUs()` | 取得单调时钟时间点 |
+| 13 | `clockUs()` | 读取原子值、推算当前音频位置并限制上限 |
+
+### 27.2 视频同步和显示
+
+| 顺序 | 函数 | 功能 |
+| ---: | --- | --- |
+| 1 | `MyDemux::videoTimeBase()` | 取得视频 PTS 的单位 |
+| 2 | `videoThread::run()` | 驱动视频解码循环 |
+| 3 | `MyDecode::receiveFrame()` | 取得视频 `AVFrame` |
+| 4 | `frameTimestampUs()` | 将视频显示时间戳换算成微秒 |
+| 5 | `synchronizeFrame()` | 组织同步判断 |
+| 6 | `audioThread::clockUs()` | 取得当前音频媒体位置 |
+| 7 | `QThread::msleep()` | 视频提前时分段等待 |
+| 8 | `SyncDecision::Drop` | 视频严重落后时跳过当前帧 |
+| 9 | `copyYuv420pFrame()` | 显示前复制紧密排列的 YUV420P |
+| 10 | `frameReady()` | 把帧排队发送到 GUI 线程 |
+| 11 | `videoOpenGLWidget::setFrame()` | 保存视频数据并请求重绘 |
+| 12 | `paintGL()` | 上传纹理并渲染画面 |
+
+## 28. 完整数值例子
+
+第一次有效音频帧：
 
 ```text
-PTS 必须结合 time_base 才有实际时间意义
+音频时间基 = {1, 48000}
+音频 PTS   = 96000
+```
 
-audioClock ≈
-    音频媒体起点
-    + QAudioOutput 已处理时长
-    + 距离最近采样经过的单调时间
+换算：
 
-audioClock 不能超过已提交 PCM 的末尾
+```text
+framePtsUs = 96000 × 1/48000 × 1000000
+           = 2000000 微秒
+           = 2.000 秒
+```
 
-videoPts - audioClock > 0：视频提前，等待
-videoPts - audioClock ≈ 0：正常显示
-videoPts - audioClock < -阈值：视频落后，丢帧
+假设此前没有提交 PCM：
 
-std::atomic 解决跨线程数据竞争
-release 用于发布此前准备好的数据
-acquire 用于接收并观察这次发布
+```text
+clockOriginUs = 2.000 秒
+```
+
+随后：
+
+```text
+QAudioOutput 已处理     = 120 ms
+最近一次音频时钟        = 2.120 秒
+距离采样又经过          = 8 ms
+已提交 PCM 末尾         = 2.200 秒
+```
+
+`clockUs()` 返回：
+
+```text
+min(2.120 + 0.008, 2.200) = 2.128 秒
+```
+
+如果当前视频帧 PTS 是 2.180 秒：
+
+```text
+difference = 2.180 - 2.128 = +52 ms
+```
+
+视频提前，`synchronizeFrame()` 分段等待。
+
+如果视频帧 PTS 是 2.070 秒：
+
+```text
+difference = 2.070 - 2.128 = -58 ms
+```
+
+假设迟到阈值为 40 ms，则当前视频帧返回 `Drop`。
+
+## 29. 当前实现的边界
+
+- `processedUSecs()` 的精度受 Qt 音频后端和系统设备影响。
+- 单调时钟推算假设音频以 1.0 倍速度连续播放，暂停和倍速需要额外处理。
+- 三个独立原子变量不是完全一致的事务快照，只满足当前毫秒级估算需求。
+- GUI 线程过忙时，`frameReady()` 排队也可能造成画面延迟。
+- 网络流或拼接媒体出现巨大 PTS 跳变时，尚未自动重建时钟。
+- 当前队列按 packet 数量背压，没有按照总字节数限制。
+- 当前重采样器结束时尚未单独排空 `SwrContext` 尾部样本。
+
+## 30. 最需要记住的内容
+
+```text
+第一阶段：audioThread 产生音频时钟
+
+音频 PTS
+  → tryStartClock() 建立媒体时间原点
+  → writePcm() 累计真正提交的 PCM
+  → processedUSecs() 取得设备处理进度
+  → refreshClock() 发布三个原子变量
+  → clockUs() 加上单调时间并限制到 PCM 末尾
+
+第二阶段：videoThread 使用音频时钟
+
+视频 PTS
+  → frameTimestampUs() 换算成微秒
+  → clockUs() 取得音频媒体位置
+  → difference = videoPts - audioClock
+  → 正数等待、接近零显示、负值超过阈值丢帧
+
+线程安全：
+
+std::atomic 防止跨线程数据竞争
+release 表示写线程完成发布
+acquire 表示读线程接收发布
 acquire/release 不会自动把多个原子变量变成一个事务
 volatile 不能代替 atomic
 ```

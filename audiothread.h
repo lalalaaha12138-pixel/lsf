@@ -46,6 +46,11 @@ public:
 
     // 返回声卡估计已经播放到的媒体时间，单位为微秒。
     // 返回 InvalidClockUs 表示声卡尚未建立有效音频时钟或已经停止。
+
+    //vedioThread clockUs()会调用这个来获取三个原子变量计算后的值 这个函数表示当前音频估计已经播放到媒体时间轴的哪个位置，具体是音频帧 PTS
+    //+ QAudioOutput 实际处理时长 + 两次采样之间的单调时钟推算
+
+
     qint64 clockUs() const;
 
 protected:
@@ -54,10 +59,18 @@ protected:
 private:
     void clearPackets();
     bool writePcm(const QByteArray &pcmData);
+
+
+    //取得音频帧时间戳：
     void tryStartClock(const AVFrame *frame);
+    //从声卡取得实际处理进度
+    //内部调用processedUSecs()
+    //由 QAudioOutput 提供，表示从调用 start() 开始，音频设备已经处理了多长时间的 PCM。并且更新三个原子变量
     void refreshClock();
     void waitForDeviceDrain();
+    //获取以写入声卡缓冲区的时间
     qint64 submittedDurationUs() const;
+    //单调时钟 确认线程调用开销
     static qint64 steadyClockUs();
 
     MyDecode m_decoder;
@@ -67,9 +80,16 @@ private:
     QQueue<AVPacket *> m_packets;
     QMutex m_packetMutex;
     QWaitCondition m_packetReady;
+
+
+    //audioThread 写入这些值
+    //videoThread 读取这些值
     std::atomic_bool m_abort{false};
+     //最近一次测得的音频媒体时间
     std::atomic<qint64> m_clockUs{InvalidClockUs};
+     //进行这次测量时的单调时钟时间
     std::atomic<qint64> m_clockUpdatedSteadyUs{InvalidClockUs};
+     //当前已经提交的 PCM 最远结束时间
     std::atomic<qint64> m_submittedEndUs{InvalidClockUs};
     bool m_acceptPackets = false;
     bool m_inputFinished = false;

@@ -237,7 +237,7 @@ void audioThread::refreshClock()
     m_clockUpdatedSteadyUs.store(steadyClockUs(), std::memory_order_release);
     m_clockUs.store(playedUs, std::memory_order_release);
 }
-
+//清空缓冲区里的pcm
 void audioThread::waitForDeviceDrain()
 {
     if (!m_playAudio || !m_clockStarted)
@@ -249,6 +249,7 @@ void audioThread::waitForDeviceDrain()
     timeout.start();
     while (!m_abort.load() && timeout.elapsed() < 1000) {
         refreshClock();
+        //判断缓冲区是否播放完 //当前没有更多 PCM 可以播放
         if (m_playAudio->state() == QAudio::IdleState ||
             m_playAudio->state() == QAudio::StoppedState) {
             break;
@@ -355,6 +356,7 @@ void audioThread::run()
     }
 
     if (decoderDrained && !m_abort.load())
+        //清空声卡缓冲区
         waitForDeviceDrain();
 
     av_frame_free(&frame);
