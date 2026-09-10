@@ -15,7 +15,7 @@
 
 ```text
 媒体文件
-  ↓ MyDemux::read()
+  ↓ MyDemux::read(&packet)
 音频 AVPacket
   ↓ audioThread / MyDecode
 解码后的 AVFrame

@@ -1,7 +1,11 @@
 #include "mydemux.h"
+
+#include <cerrno>
+
 extern "C"{
     #include <libavformat/avformat.h>
     #include <libavutil/avutil.h>
+    #include <libavutil/error.h>
     #include <libavcodec/avcodec.h>
 }
 //static double r2d(AVRational time_stamp){
@@ -87,24 +91,34 @@ bool MyDemux::open(const char *url)
 
     return true;
 }
-//读取一个packet
-AVPacket *MyDemux::read()
+int MyDemux::read(AVPacket **packet)
 {
-    std::unique_lock<std::mutex> readLock(this->mtx_);
-    if (this->format == nullptr)return nullptr;
-    AVPacket *temp = av_packet_alloc();
+    // 输出参数无效时无法安全返回数据包。
+    if (!packet)
+        return AVERROR(EINVAL);
 
-    if (!temp)return nullptr;
-    int ret;
-    ret = av_read_frame(this->format,temp);
-    if (ret <0){
-        char buf[1024] = {0};
-        av_strerror(ret,buf,sizeof(buf) -1);
-        av_packet_free(&temp);
-        return nullptr;
+    // 失败路径必须保证调用方不会拿到旧指针。
+    *packet = nullptr;
+
+    std::unique_lock<std::mutex> readLock(this->mtx_);
+    if (!format)
+        return AVERROR(EINVAL);
+
+    AVPacket *newPacket = av_packet_alloc();
+    if (!newPacket)
+        return AVERROR(ENOMEM);
+
+    // 不把负数统一转换成 nullptr，而是把 FFmpeg 原始返回值交给上层。
+    // 上层因此可以区分正常 EOF、暂时无数据和真正的读取错误。
+    const int ret = av_read_frame(format, newPacket);
+    if (ret < 0) {
+        av_packet_free(&newPacket);
+        return ret;
     }
 
-    return temp;
+    // av_read_frame() 返回 0 才会进入这里；从此由调用方释放数据包。
+    *packet = newPacket;
+    return 0;
 }
 
 MyDemux::PacketType MyDemux::packetType(const AVPacket *packet)

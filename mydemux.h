@@ -25,7 +25,12 @@ public:
     virtual bool open(const char *url);
     virtual void close();
     virtual void clear();
-    virtual AVPacket *read();
+
+    // 读取一个压缩数据包，并保留 av_read_frame() 的返回状态。
+    // 返回 0 时，*packet 指向新分配的数据包，所有权交给调用者；
+    // 返回负数时，*packet 保持为 nullptr，可用 AVERROR_EOF、
+    // AVERROR(EAGAIN) 或其他 FFmpeg 错误码区分具体情况。
+    virtual int read(AVPacket **packet);
     virtual PacketType packetType(const AVPacket *packet);
     // 返回新分配的视频编码参数，所有权交给调用者。
     // 当前 MyDecode::open 会接管并释放它。

@@ -55,7 +55,7 @@ classDiagram
         -int audioStream
         -int64_t totalMs
         +open(const char *url) bool
-        +read() AVPacket*
+        +read(AVPacket **packet) int
         +packetType(const AVPacket *packet) PacketType
         +getVideoParameters() AVCodecParameters*
         +getAudioParameters() AVCodecParameters*
@@ -171,7 +171,7 @@ sequenceDiagram
     Player->>Player: 启动 m_packetTimer
 
     loop 快速预读，直到包队列达到容量上限
-        Player->>Demux: read() / packetType()
+        Player->>Demux: read(&packet) / packetType()
         alt 视频包
             Player->>VideoThread: pushPacket(packet)
             VideoThread->>VideoThread: sendPacket / receiveFrame
@@ -244,15 +244,18 @@ sequenceDiagram
 
 调用 `avformat_flush()` 清理解封装器内部缓存，但不关闭媒体。通常在 seek 后或需要重新同步读取状态时使用。
 
-#### `AVPacket *read()`
+#### `int read(AVPacket **packet)`
 
 使用 `av_packet_alloc()` 创建数据包，再通过 `av_read_frame()` 读取下一个压缩包。
 
-- 成功：返回新分配的 `AVPacket *`。
-- 文件结束或读取失败：释放临时包并返回 `nullptr`。
-- 所有权：调用者必须使用 `av_packet_free()` 释放返回的数据包。
+- 返回 `0`：读取成功，`*packet` 指向新分配的 `AVPacket`。
+- 返回 `AVERROR_EOF`：解封装器已经正常读到输入末尾。
+- 返回 `AVERROR(EAGAIN)`：非阻塞输入暂时没有可读数据，稍后可以重试。
+- 返回其他负数：读取失败，返回值保留 FFmpeg 的具体错误原因。
+- 返回负数时：函数保证 `*packet == nullptr`。
+- 所有权：只有返回 `0` 时，调用者才取得数据包所有权，并必须使用 `av_packet_free()` 释放。
 
-当前实现用 `nullptr` 同时表示文件结束和读取错误，尚未区分这两种状态。
+`Widget::dispatchNextPackets()` 根据返回值分别处理暂时无数据、正常 EOF 和读取错误，不再通过空指针猜测输入状态。
 
 #### `PacketType packetType(const AVPacket *packet)`
 
@@ -644,11 +647,13 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 定时器驱动的数据包分发函数：
 
 1. 先检查音频和视频包队列容量，任一队列满时暂停本轮读取。
-2. 循环调用 `MyDemux::read()`，单轮最多处理 256 个包。
+2. 循环调用 `MyDemux::read(&packet)`，单轮最多处理 256 个包。
 3. 将音频包交给 `audioThread::pushPacket()`。
 4. 将视频包交给 `videoThread::pushPacket()`。
 5. 释放字幕等未处理的数据包。
-6. 文件结束时停止定时器，并调用两个线程的 `finishPackets()`。
+6. 返回 `EAGAIN` 时保留定时器并等待下一轮重试。
+7. 返回 `AVERROR_EOF` 时停止定时器，并调用两个线程的 `finishPackets()`。
+8. 返回其他错误时记录 FFmpeg 错误信息，再停止读取并排空已有数据。
 
 定时器只负责快速预读，播放节奏由视频 PTS 和音频时钟决定。单次调用最多检查 256 个包，以免解封装工作长时间占用 GUI 线程。
 
@@ -691,8 +696,8 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 | `AVFormatContext` | `avformat_open_input()` | `MyDemux::close()` |
 | 视频/音频 `AVCodecParameters` | `MyDemux` 参数接口 | 对应的 `MyDecode::open()` |
 | `AVCodecContext` | `MyDecode::open()` | `MyDecode::close()` |
-| 视频 `AVPacket` | `MyDemux::read()` | `videoThread::run()` 或 `clearPackets()` |
-| 音频 `AVPacket` | `MyDemux::read()` | `audioThread::run()` 或 `clearPackets()` |
+| 视频 `AVPacket` | `MyDemux::read(&packet)` | `videoThread::run()` 或 `clearPackets()` |
+| 音频 `AVPacket` | `MyDemux::read(&packet)` | `audioThread::run()` 或 `clearPackets()` |
 | 视频 `AVFrame` | `videoThread::run()` | 同一个 `run()` 退出前 |
 | 音频 `AVFrame` | `audioThread::run()` | 同一个 `run()` 退出前 |
 | 帧中的数据引用 | `MyDecode::receiveFrame()` | 对应线程处理完每帧后 `av_frame_unref()` |
@@ -710,7 +715,6 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 - 音视频解码已经进入工作线程，但解封装仍由 GUI 定时器执行，网络流可能阻塞界面。
 - GUI 投包节奏仍参考容器推测的平均帧率，视频最终显示时刻已经依据每帧 PTS 调度。
 - 尚未实现暂停、继续、进度条、seek 后解码状态重置和循环播放。
-- `MyDemux::read()` 目前无法区分正常 EOF 与读取错误。
 
 ## 16. 构建环境
 

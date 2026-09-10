@@ -10,6 +10,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
 }
 
 Widget::Widget(QWidget *parent)
@@ -105,8 +106,40 @@ void Widget::dispatchNextPackets()
             return;
         }
 
-        AVPacket *packet = m_demux.read();
+        AVPacket *packet = nullptr;
+        const int readResult = m_demux.read(&packet);
+
+        // 非阻塞输入可能暂时没有新数据。保留定时器，下一轮继续读取，
+        // 不能把 EAGAIN 当作文件结束去排空解码器。
+        if (readResult == AVERROR(EAGAIN))
+            return;
+
+        // AVERROR_EOF 才表示解封装器确认不会再产生新的数据包。
+        if (readResult == AVERROR_EOF) {
+            m_packetTimer.stop();
+            m_videoThread.finishPackets();
+            m_audioThread.finishPackets();
+            return;
+        }
+
+        // 其他负数是真正的读取错误。停止继续读取，并让工作线程处理完
+        // 已经进入队列和解码器缓存的数据，错误原因保留在日志中。
+        if (readResult < 0) {
+            char errorText[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(readResult, errorText, sizeof(errorText));
+            qWarning().noquote()
+                << "Reading a media packet failed:" << errorText
+                << "(" << readResult << ")";
+            m_packetTimer.stop();
+            m_videoThread.finishPackets();
+            m_audioThread.finishPackets();
+            return;
+        }
+
+        // read() 的契约规定成功时 packet 一定有效；保留这层检查，避免
+        // 将来修改解封装器后把空指针继续传给 packetType()。
         if (!packet) {
+            qWarning() << "Demuxer returned success without a packet";
             m_packetTimer.stop();
             m_videoThread.finishPackets();
             m_audioThread.finishPackets();
