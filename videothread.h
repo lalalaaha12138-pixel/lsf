@@ -61,7 +61,11 @@ private:
     };
 
     static bool copyYuv420pFrame(const AVFrame *frame, QByteArray *frameData);
+
+    //返回的是多少份的时间基数 也就是frame的pts
     qint64 frameTimestampUs(const AVFrame *frame) const;
+
+    //
     SyncDecision synchronizeFrame(const AVFrame *frame);
     void clearPackets();
 

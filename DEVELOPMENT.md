@@ -29,6 +29,7 @@ MyDemux 解封装
 | `playaudio.h/.cpp` | 封装 Qt `QAudioOutput`，控制默认音频设备和 PCM 写入 |
 | `videoopenglwidget.h/.cpp` | YUV420P 视频帧的 OpenGL 渲染控件 |
 | `AUDIO_RESAMPLING_GUIDE.md` | 音频基础、重采样原理、FFmpeg API 与当前实现学习指南 |
+| `AV_SYNC_GUIDE.md` | 音视频同步、音频主时钟、视频调度与 C++ 原子内存顺序详解 |
 | `widget.ui` | Qt Designer 生成的主窗口基础 UI |
 | `MyPlay2.pro` | qmake 项目配置、源文件清单和 FFmpeg 链接配置 |
 

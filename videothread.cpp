@@ -41,7 +41,7 @@ bool videoThread::open(AVCodecParameters *parameters,
     // MyDecode::open 接管并释放 parameters。
     if (!m_decoder.open(parameters, timeBase))
         return false;
-
+    //format->streams[videoStream]->time_base;
     m_timeBase = timeBase;
     m_audioClockSource = audioClockSource;
     m_videoTimer.invalidate();
@@ -171,13 +171,27 @@ qint64 videoThread::frameTimestampUs(const AVFrame *frame) const
     return av_rescale_q(timestamp, m_timeBase, AV_TIME_BASE_Q);
 }
 
+
+//返回的是枚举值
+//Present,
+//Drop,
+//Abort
 videoThread::SyncDecision videoThread::synchronizeFrame(const AVFrame *frame)
 {
+    //videoPtsUs是frame的在媒体轴上的微秒
     const qint64 videoPtsUs = frameTimestampUs(frame);
+    //因为不知道它应该在什么时候显示，所以只能直接显示，无法同步。
     if (videoPtsUs == AV_NOPTS_VALUE)
         return SyncDecision::Present;
 
-    // 本地计时器既是无音频时的主时钟，也是音频结束后的回退时钟。
+    // 本地计时器m_videoTimer既是无音频时的主时钟，也是音频结束后的回退时钟。
+
+
+//    正常存在音频时，视频使用音频时钟；以下情况会改用备用时钟：
+//    - 文件没有音频流。
+//    - 音频设备打开失败。
+//    - 音频帧没有有效 PTS。
+//    - 音频已经播放结束。
     if (!m_videoTimer.isValid()) {
         m_firstVideoPtsUs = videoPtsUs;
         m_videoTimer.start();
@@ -186,9 +200,10 @@ videoThread::SyncDecision videoThread::synchronizeFrame(const AVFrame *frame)
     qint64 audioClockUs = m_audioClockSource
         ? m_audioClockSource->clockUs()
         : audioThread::InvalidClockUs;
-
+    //如果有音频 计算视频与音频的时间差
     if (audioClockUs != audioThread::InvalidClockUs) {
-        qint64 frameDurationUs = 40000;
+        qint64 frameDurationUs = 40000;//默认40000份时间基数
+        //如果这帧保留了持续时间就更新 frameDurationUs
         if (frame->duration > 0) {
             frameDurationUs = av_rescale_q(
                 frame->duration, m_timeBase, AV_TIME_BASE_Q);
@@ -196,8 +211,12 @@ videoThread::SyncDecision videoThread::synchronizeFrame(const AVFrame *frame)
 
         // 视频落后超过约一帧时直接丢弃；阈值限制在 20~100 ms，
         // 避免异常 duration 导致所有帧都被丢弃或完全不丢帧。
+
+        //qBound 三个参数先后两个取小，最后两者取大 设定延时lateThresholdUs 在20ms到100ms之间
         const qint64 lateThresholdUs = qBound<qint64>(
             20000, qAbs(frameDurationUs), 100000);
+
+        //differenceUs代表真实延时
         qint64 differenceUs = videoPtsUs - audioClockUs;
         if (differenceUs < -lateThresholdUs)
             return SyncDecision::Drop;
@@ -261,7 +280,7 @@ void videoThread::run()
                 av_frame_unref(frame);
                 break;
             }
-
+            //因为不知道它应该在什么时候显示，所以只能直接显示，无法同步。
             if (decision == SyncDecision::Present) {
                 QByteArray frameData;
                 if (copyYuv420pFrame(frame, &frameData))
