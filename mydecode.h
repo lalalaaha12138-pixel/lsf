@@ -1,5 +1,10 @@
 #ifndef MYDECODE_H
 #define MYDECODE_H
+
+extern "C" {
+#include <libavutil/rational.h>
+}
+
 #include <mutex>
 struct AVCodecParameters;
 struct AVCodecContext;
@@ -12,7 +17,8 @@ public:
     virtual ~MyDecode();
 
     // 打开与 para 对应的解码器，并接管 para 的所有权；无论成功失败都会释放它。
-    virtual bool open(AVCodecParameters * para);
+    // packetTimeBase 是压缩包 PTS/DTS 的时间基，解码器用它推导帧时间戳。
+    virtual bool open(AVCodecParameters *para, AVRational packetTimeBase);
 
     // FFmpeg 新式解码流程：先 sendPacket 投递压缩包，再用 receiveFrame 取帧。
     // packet 为 nullptr 时表示输入结束，要求解码器输出内部缓存的延迟帧。

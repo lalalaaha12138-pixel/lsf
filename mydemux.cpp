@@ -174,6 +174,23 @@ double MyDemux::videoFrameRate()
         format, format->streams[videoStream], nullptr);
     return rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
 }
+
+AVRational MyDemux::videoTimeBase()
+{
+    std::lock_guard<std::mutex> timeBaseLock(mtx_);
+    if (!format || videoStream < 0)
+        return AVRational{0, 1};
+    return format->streams[videoStream]->time_base;
+}
+
+AVRational MyDemux::audioTimeBase()
+{
+    std::lock_guard<std::mutex> timeBaseLock(mtx_);
+    if (!format || audioStream < 0)
+        return AVRational{0, 1};
+    return format->streams[audioStream]->time_base;
+}
+
 //跳转到秒数
 bool MyDemux::Seek(double pos)
 {

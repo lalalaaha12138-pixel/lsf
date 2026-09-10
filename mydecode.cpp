@@ -14,7 +14,7 @@ MyDecode::~MyDecode()
     close();
 }
 
-bool MyDecode::open(AVCodecParameters *para)
+bool MyDecode::open(AVCodecParameters *para, AVRational packetTimeBase)
 {
     // 一个 MyDecode 实例可以反复打开不同的视频流。
     close();
@@ -47,6 +47,10 @@ bool MyDecode::open(AVCodecParameters *para)
     // 允许 FFmpeg 在支持的解码器中使用帧级或切片级多线程。
     codecCtx->thread_count = 6;
 
+    // 解码时 AVPacket 的时间戳来自 AVStream::time_base。
+    // 设置 pkt_timebase 后，FFmpeg 才能正确推导 best_effort_timestamp。
+    if (packetTimeBase.num > 0 && packetTimeBase.den > 0)
+        codecCtx->pkt_timebase = packetTimeBase;
 
     ret = avcodec_open2(codecCtx,codecTemp, nullptr);
     if (ret < 0){

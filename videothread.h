@@ -4,6 +4,7 @@
 #include "mydecode.h"
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QQueue>
 #include <QThread>
@@ -13,9 +14,10 @@
 struct AVCodecParameters;
 struct AVFrame;
 struct AVPacket;
+class audioThread;
 
 // 视频工作线程：接收 Widget 分发的视频包，在 run() 中完成解码，
-// 再将拥有独立生命周期的 YUV420P 数据发送给渲染控件。
+// 以音频时钟同步显示时间，再发送拥有独立生命周期的 YUV420P 数据。
 class videoThread : public QThread
 {
     Q_OBJECT
@@ -25,10 +27,16 @@ public:
     ~videoThread() override;
 
     // 打开视频解码器并启动线程。函数接管 parameters 的所有权。
-    bool open(AVCodecParameters *parameters);
+    // audioClockSource 为 nullptr 时使用视频 PTS 和本地单调时钟自行调度。
+    bool open(AVCodecParameters *parameters,
+              AVRational timeBase,
+              const audioThread *audioClockSource);
 
     // 接管 packet 的所有权；线程处理完成后会调用 av_packet_free。
     bool pushPacket(AVPacket *packet);
+
+    // 供解封装线程实施背压；队列达到上限时暂停继续读取文件。
+    bool hasPacketCapacity();
 
     // 通知线程后续不会再有视频包，使解码器输出内部延迟帧。
     void finishPackets();
@@ -45,7 +53,16 @@ protected:
     void run() override;
 
 private:
+    enum class SyncDecision
+    {
+        Present,
+        Drop,
+        Abort
+    };
+
     static bool copyYuv420pFrame(const AVFrame *frame, QByteArray *frameData);
+    qint64 frameTimestampUs(const AVFrame *frame) const;
+    SyncDecision synchronizeFrame(const AVFrame *frame);
     void clearPackets();
 
     MyDecode m_decoder;
@@ -55,6 +72,14 @@ private:
     std::atomic_bool m_abort{false};
     bool m_acceptPackets = false;
     bool m_inputFinished = false;
+
+    // open() 在线程启动前写入，run() 中只读。
+    AVRational m_timeBase{0, 1};
+    const audioThread *m_audioClockSource = nullptr;
+
+    // 没有可用音频时钟时，以第一帧视频 PTS 为起点自行控制播放速度。
+    QElapsedTimer m_videoTimer;
+    qint64 m_firstVideoPtsUs = 0;
 };
 
 #endif // VIDEOTHREAD_H

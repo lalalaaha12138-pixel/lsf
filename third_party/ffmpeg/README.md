@@ -23,8 +23,4 @@
 
 升级 FFmpeg 时必须同时替换 `include/`、`lib/` 和 `bin/`，不要混用不同版本。若 DLL 主版本号变化，还要同步修改 `MyPlay2.pro` 中的 `FFMPEG_RUNTIME_DLLS` 文件名，然后重新运行 qmake 并完成一次干净构建。
 
-`bin/*.dll` 使用 Git LFS 保存。首次克隆后如果 DLL 只是文本指针，请先执行：
-
-```powershell
-git lfs pull
-```
+`bin/*.dll` 当前直接使用普通 Git 保存，不要求克隆电脑额外安装 Git LFS。由于 `avcodec-63.dll` 体积较大，升级依赖前应先确认单个文件没有超过远程仓库的普通文件大小限制。

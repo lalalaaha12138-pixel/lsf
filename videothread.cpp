@@ -1,13 +1,17 @@
 #include "videothread.h"
 
+#include "audiothread.h"
+
 #include <QDebug>
 #include <QMutexLocker>
+#include <QtGlobal>
 #include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -21,16 +25,27 @@ videoThread::~videoThread()
     stopVideo();
 }
 
-bool videoThread::open(AVCodecParameters *parameters)
+bool videoThread::open(AVCodecParameters *parameters,
+                       AVRational timeBase,
+                       const audioThread *audioClockSource)
 {
     stopVideo();
     if (!parameters)
         return false;
+    if (timeBase.num <= 0 || timeBase.den <= 0) {
+        // open() 的契约是只要收到 parameters 就接管所有权。
+        avcodec_parameters_free(&parameters);
+        return false;
+    }
 
     // MyDecode::open 接管并释放 parameters。
-    if (!m_decoder.open(parameters))
+    if (!m_decoder.open(parameters, timeBase))
         return false;
 
+    m_timeBase = timeBase;
+    m_audioClockSource = audioClockSource;
+    m_videoTimer.invalidate();
+    m_firstVideoPtsUs = 0;
     {
         QMutexLocker locker(&m_packetMutex);
         m_abort.store(false);
@@ -58,6 +73,14 @@ bool videoThread::pushPacket(AVPacket *packet)
     return true;
 }
 
+bool videoThread::hasPacketCapacity()
+{
+    QMutexLocker locker(&m_packetMutex);
+    // 允许预读若干视频包，使同步线程落后时可以连续丢帧追赶，
+    // 同时限制内存不会随着媒体时长无限增长。
+    return m_packets.size() < 64;
+}
+
 void videoThread::finishPackets()
 {
     QMutexLocker locker(&m_packetMutex);
@@ -79,6 +102,8 @@ void videoThread::stopVideo()
 
     clearPackets();
     m_decoder.close();
+    m_audioClockSource = nullptr;
+    m_videoTimer.invalidate();
 
     QMutexLocker locker(&m_packetMutex);
     m_inputFinished = false;
@@ -131,6 +156,88 @@ bool videoThread::copyYuv420pFrame(const AVFrame *frame,
     return true;
 }
 
+qint64 videoThread::frameTimestampUs(const AVFrame *frame) const
+{
+    if (!frame || m_timeBase.num <= 0 || m_timeBase.den <= 0)
+        return AV_NOPTS_VALUE;
+
+    // 解码视频可能存在 B 帧，best_effort_timestamp 比 pkt_dts 更接近显示顺序。
+    int64_t timestamp = frame->best_effort_timestamp;
+    if (timestamp == AV_NOPTS_VALUE)
+        timestamp = frame->pts;
+    if (timestamp == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+
+    return av_rescale_q(timestamp, m_timeBase, AV_TIME_BASE_Q);
+}
+
+videoThread::SyncDecision videoThread::synchronizeFrame(const AVFrame *frame)
+{
+    const qint64 videoPtsUs = frameTimestampUs(frame);
+    if (videoPtsUs == AV_NOPTS_VALUE)
+        return SyncDecision::Present;
+
+    // 本地计时器既是无音频时的主时钟，也是音频结束后的回退时钟。
+    if (!m_videoTimer.isValid()) {
+        m_firstVideoPtsUs = videoPtsUs;
+        m_videoTimer.start();
+    }
+
+    qint64 audioClockUs = m_audioClockSource
+        ? m_audioClockSource->clockUs()
+        : audioThread::InvalidClockUs;
+
+    if (audioClockUs != audioThread::InvalidClockUs) {
+        qint64 frameDurationUs = 40000;
+        if (frame->duration > 0) {
+            frameDurationUs = av_rescale_q(
+                frame->duration, m_timeBase, AV_TIME_BASE_Q);
+        }
+
+        // 视频落后超过约一帧时直接丢弃；阈值限制在 20~100 ms，
+        // 避免异常 duration 导致所有帧都被丢弃或完全不丢帧。
+        const qint64 lateThresholdUs = qBound<qint64>(
+            20000, qAbs(frameDurationUs), 100000);
+        qint64 differenceUs = videoPtsUs - audioClockUs;
+        if (differenceUs < -lateThresholdUs)
+            return SyncDecision::Drop;
+
+        // 视频早于音频时分段等待。每次最多睡 10 ms，以便及时响应停止，
+        // 并重新读取不断前进的音频时钟，避免一次睡眠过长造成过冲。
+        while (differenceUs > 2000 && !m_abort.load()) {
+            const unsigned long sleepMs = static_cast<unsigned long>(
+                qBound<qint64>(1, (differenceUs - 2000 + 999) / 1000, 10));
+            QThread::msleep(sleepMs);
+
+            audioClockUs = m_audioClockSource->clockUs();
+            if (audioClockUs == audioThread::InvalidClockUs)
+                break;
+
+            differenceUs = videoPtsUs - audioClockUs;
+            if (differenceUs < -lateThresholdUs)
+                return SyncDecision::Drop;
+        }
+
+        return m_abort.load() ? SyncDecision::Abort : SyncDecision::Present;
+    }
+
+    // 没有音频、音频尚未建立 PTS，或者音频已经结束时，
+    // 按视频自身 PTS 相对于第一帧的时间控制显示，避免瞬间播放完整个视频。
+    const qint64 targetElapsedUs = videoPtsUs - m_firstVideoPtsUs;
+    while (!m_abort.load()) {
+        const qint64 remainingUs = targetElapsedUs
+            - m_videoTimer.nsecsElapsed() / 1000;
+        if (remainingUs <= 2000)
+            break;
+
+        const unsigned long sleepMs = static_cast<unsigned long>(
+            qBound<qint64>(1, (remainingUs - 2000 + 999) / 1000, 10));
+        QThread::msleep(sleepMs);
+    }
+
+    return m_abort.load() ? SyncDecision::Abort : SyncDecision::Present;
+}
+
 void videoThread::run()
 {
     AVFrame *frame = av_frame_alloc();
@@ -149,9 +256,18 @@ void videoThread::run()
         // 优先取走已有输出，保持 FFmpeg send/receive 状态机平衡。
         int ret = m_decoder.receiveFrame(frame);
         if (ret == 0) {
-            QByteArray frameData;
-            if (copyYuv420pFrame(frame, &frameData))
-                emit frameReady(frameData, frame->width, frame->height);
+            const SyncDecision decision = synchronizeFrame(frame);
+            if (decision == SyncDecision::Abort) {
+                av_frame_unref(frame);
+                break;
+            }
+
+            if (decision == SyncDecision::Present) {
+                QByteArray frameData;
+                if (copyYuv420pFrame(frame, &frameData))
+                    emit frameReady(frameData, frame->width, frame->height);
+            }
+            // Drop 时不复制、不发送帧，下一帧会继续与最新音频时钟比较。
             av_frame_unref(frame);
             continue;
         }

@@ -2,7 +2,7 @@
 
 ## 1. 项目目标
 
-MyPlay2 是一个基于 Qt、FFmpeg 和 OpenGL 的简化音视频播放器。视频由 GUI 定时器驱动解码并交给 `videoOpenGLWidget` 渲染；音频包由 `Widget` 分发给 `audioThread`，在线程内完成解码、重采样和设备播放。当前暂不处理音画同步。
+MyPlay2 是一个基于 Qt、FFmpeg 和 OpenGL 的简化音视频播放器。`Widget` 负责解封装和分发数据包，音视频分别在线程中解码。音频设备播放进度作为主时钟，视频线程根据每帧 PTS 等待或丢帧，再交给 `videoOpenGLWidget` 渲染。
 
 当前处理流程如下：
 
@@ -11,8 +11,8 @@ MyPlay2 是一个基于 Qt、FFmpeg 和 OpenGL 的简化音视频播放器。视
   ↓
 MyDemux 解封装
   ↓ AVPacket
-  ├─ 视频 AVPacket → MyDecode → YUV420P AVFrame → videoOpenGLWidget
-  └─ 音频 AVPacket → audioThread → MyDecode → AudioResample → PlayAudio
+  ├─ 视频 AVPacket → MyDecode → 比较视频 PTS 与音频时钟 → videoOpenGLWidget
+  └─ 音频 AVPacket → MyDecode → AudioResample → PlayAudio → 发布音频时钟
 ```
 
 ## 2. 源文件说明
@@ -28,6 +28,7 @@ MyDemux 解封装
 | `audioresample.h/.cpp` | 使用 libswresample 将解码音频转换为设备 PCM 格式 |
 | `playaudio.h/.cpp` | 封装 Qt `QAudioOutput`，控制默认音频设备和 PCM 写入 |
 | `videoopenglwidget.h/.cpp` | YUV420P 视频帧的 OpenGL 渲染控件 |
+| `AUDIO_RESAMPLING_GUIDE.md` | 音频基础、重采样原理、FFmpeg API 与当前实现学习指南 |
 | `widget.ui` | Qt Designer 生成的主窗口基础 UI |
 | `MyPlay2.pro` | qmake 项目配置、源文件清单和 FFmpeg 链接配置 |
 
@@ -58,6 +59,8 @@ classDiagram
         +getVideoParameters() AVCodecParameters*
         +getAudioParameters() AVCodecParameters*
         +videoFrameRate() double
+        +videoTimeBase() AVRational
+        +audioTimeBase() AVRational
         +Seek(double pos) bool
         +clear()
         +close()
@@ -65,7 +68,7 @@ classDiagram
 
     class MyDecode {
         -AVCodecContext *codecCtx
-        +open(AVCodecParameters *para) bool
+        +open(AVCodecParameters *para, AVRational timeBase) bool
         +sendPacket(const AVPacket *packet) int
         +receiveFrame(AVFrame *frame) int
         +clear()
@@ -85,8 +88,9 @@ classDiagram
     class videoThread {
         -MyDecode m_decoder
         -QQueue~AVPacket*~ m_packets
-        +open(AVCodecParameters *parameters) bool
+        +open(AVCodecParameters *parameters, AVRational timeBase, audioThread *clock) bool
         +pushPacket(AVPacket *packet) bool
+        +hasPacketCapacity() bool
         +finishPackets()
         +stopVideo()
         #run()
@@ -97,8 +101,10 @@ classDiagram
         -AudioResample m_resample
         -PlayAudio *m_playAudio
         -QQueue~AVPacket*~ m_packets
-        +open(AVCodecParameters *parameters) bool
+        +open(AVCodecParameters *parameters, AVRational timeBase) bool
+        +clockUs() qint64
         +pushPacket(AVPacket *packet) bool
+        +hasPacketCapacity() bool
         +finishPackets()
         +stopAudio()
         #run()
@@ -130,6 +136,7 @@ classDiagram
     audioThread *-- MyDecode : 音频解码器
     audioThread *-- AudioResample : 重采样器
     audioThread *-- PlayAudio : 在线程内创建
+    videoThread --> audioThread : 原子读取音频时钟
     MyDemux --> AVPacket : 创建压缩包
     MyDecode --> AVPacket : 接收
     MyDecode --> AVFrame : 填充
@@ -153,20 +160,22 @@ sequenceDiagram
 
     Main->>Player: openMedia(fileName)
     Player->>Demux: open(url)
+    Player->>Demux: getAudioParameters()
+    Player->>AudioThread: open(audioParameters, audioTimeBase)
+    AudioThread->>Audio: 在线程内打开默认设备
     Player->>Demux: getVideoParameters()
     Demux-->>Player: AVCodecParameters*
-    Player->>VideoThread: open(videoParameters)
-    Player->>Demux: getAudioParameters()
-    Player->>AudioThread: open(audioParameters)
-    AudioThread->>Audio: 在线程内打开默认设备
+    Player->>VideoThread: open(videoParameters, videoTimeBase, audioClock)
     Player->>Demux: videoFrameRate()
     Player->>Player: 启动 m_packetTimer
 
-    loop 每个视频帧周期
+    loop 快速预读，直到包队列达到容量上限
         Player->>Demux: read() / packetType()
         alt 视频包
             Player->>VideoThread: pushPacket(packet)
             VideoThread->>VideoThread: sendPacket / receiveFrame
+            VideoThread->>AudioThread: clockUs()
+            VideoThread->>VideoThread: 等待、显示或丢帧
             VideoThread->>VideoThread: 复制紧密排列的 YUV420P
             VideoThread-->>Renderer: frameReady(QByteArray, width, height)
             Renderer->>Renderer: setFrame() / update() / paintGL()
@@ -176,6 +185,7 @@ sequenceDiagram
             AudioThread->>Resample: convert(frame, outputFormat)
             Resample-->>AudioThread: PCM
             AudioThread->>Audio: write(PCM)
+            AudioThread->>AudioThread: 更新原子音频时钟
         end
     end
 ```
@@ -263,7 +273,11 @@ sequenceDiagram
 
 #### `double videoFrameRate()`
 
-调用 `av_guess_frame_rate()` 推测视频帧率，并转换为 `double`。无法确定帧率时返回 `0.0`，`Widget` 随后使用 33 ms 作为默认帧间隔。
+调用 `av_guess_frame_rate()` 推测视频帧率，并转换为 `double`。无法确定帧率时返回 `0.0`。当前最终显示节奏以逐帧 PTS 为准，该接口保留用于帧率信息展示或没有时间戳时的扩展回退。
+
+#### `AVRational videoTimeBase()` / `audioTimeBase()`
+
+返回对应 `AVStream::time_base`。音频和视频的原始 PTS 只有结合各自时间基才能换算成实际时间；找不到对应流时返回无效时间基 `{0, 1}`。
 
 #### `bool Seek(double pos)`
 
@@ -294,7 +308,7 @@ sequenceDiagram
 
 调用 `close()` 释放 `AVCodecContext`。
 
-#### `bool open(AVCodecParameters *para)`
+#### `bool open(AVCodecParameters *para, AVRational packetTimeBase)`
 
 根据流参数初始化解码器：
 
@@ -303,7 +317,8 @@ sequenceDiagram
 3. 分配 `AVCodecContext`。
 4. 将流参数复制到解码上下文。
 5. 设置解码线程数为 6。
-6. 调用 `avcodec_open2()` 打开解码器。
+6. 将流时间基写入 `AVCodecContext::pkt_timebase`，供 FFmpeg 推导帧时间戳。
+7. 调用 `avcodec_open2()` 打开解码器。
 
 该函数接管 `para` 的所有权，并在成功或失败路径中释放它。调用者传入后不应再次访问或释放该指针。
 
@@ -341,13 +356,17 @@ sequenceDiagram
 
 `videoThread` 继承 `QThread`，持有视频 `MyDecode` 和线程安全的 `AVPacket` 队列。视频解码从 GUI 线程迁移到 `run()` 后，`Widget` 不再直接参与 FFmpeg 的 send/receive 状态机。
 
-### `bool open(AVCodecParameters *parameters)`
+### `bool open(AVCodecParameters *parameters, AVRational timeBase, const audioThread *audioClockSource)`
 
-停止上一段视频线程、打开视频解码器、重置退出和 EOF 状态并启动线程。函数接管 `parameters` 所有权。
+停止上一段视频线程、保存视频流时间基和音频时钟来源、打开视频解码器、重置退出和 EOF 状态并启动线程。函数接管 `parameters` 所有权。没有音频时可传入 `nullptr`，视频会使用自身 PTS 和 `QElapsedTimer` 调度。
 
 ### `bool pushPacket(AVPacket *packet)`
 
 将视频包加入队列并唤醒线程。函数接管包所有权；线程停止或不再接收包时也会立即释放该包。
+
+### `bool hasPacketCapacity()`
+
+在线程锁保护下检查视频包队列是否少于 64 个。`Widget` 在容量耗尽时暂停解封装，消费后继续；有限预读既允许同步线程连续丢帧追赶，又避免内存无限增长。
 
 ### `void finishPackets()`
 
@@ -364,9 +383,16 @@ sequenceDiagram
 1. 优先调用 `receiveFrame()` 取走已有输出。
 2. 返回 `EAGAIN` 时等待并取得下一个视频包。
 3. 使用 `sendPacket()` 投递压缩包。
-4. 收到 YUV420P 帧后调用 `copyYuv420pFrame()`。
-5. 发出 `frameReady(QByteArray, width, height)` 信号。
-6. EOF 时排空解码器，退出时释放 `AVFrame`、队列和解码器。
+4. 使用 `best_effort_timestamp` 和视频时间基将 PTS 换算成微秒。
+5. 调用 `synchronizeFrame()` 与音频时钟比较：视频早则分段等待，落后超过约一帧则丢帧。
+6. 需要显示时调用 `copyYuv420pFrame()` 并发出 `frameReady()` 信号。
+7. EOF 时排空解码器，退出时释放 `AVFrame`、队列和解码器。
+
+### `SyncDecision synchronizeFrame(const AVFrame *frame)`
+
+执行视频同步音频的核心策略。`videoPts - audioClock` 为正表示视频早了，线程每次最多等待 10 ms 后重新读取音频时钟；差值小于负的迟到阈值表示视频已经落后，当前帧直接丢弃。迟到阈值根据帧 `duration` 计算，并限制在 20~100 ms。
+
+音频时钟不可用时，以第一帧视频 PTS 和 `QElapsedTimer` 建立回退时钟，保证无音频文件仍按正常速度播放。
 
 ### `bool copyYuv420pFrame(const AVFrame *frame, QByteArray *frameData)`
 
@@ -535,13 +561,21 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 `audioThread` 继承 `QThread`。它持有 `MyDecode`、`AudioResample` 和 `PlayAudio`，并通过 `QQueue<AVPacket *>` 接收 `Widget` 分发的音频包。
 
-### `bool open(AVCodecParameters *parameters)`
+### `bool open(AVCodecParameters *parameters, AVRational timeBase)`
 
-停止上一段音频，打开音频解码器，重置退出和 EOF 状态，然后启动线程。函数接管 `parameters` 所有权。
+停止上一段音频，保存音频流时间基、打开音频解码器、重置退出、EOF 和音频时钟状态，然后启动线程。函数接管 `parameters` 所有权。
+
+### `qint64 clockUs() const`
+
+通过原子变量返回声卡估计已经播放到的媒体时间，单位为微秒。`InvalidClockUs` 表示音频时钟尚未建立或已经停止；使用最小整数作为无效值，可以保留媒体中合法的负 PTS。视频线程只读该原子值，不会跨线程直接访问 `QAudioOutput`。
 
 ### `bool pushPacket(AVPacket *packet)`
 
 将音频包放入线程安全队列并唤醒工作线程。函数无论成功失败都会接管并负责释放 `packet`，调用者不得再次使用该指针。
+
+### `bool hasPacketCapacity()`
+
+在线程锁保护下检查音频包队列是否少于 256 个。容量上限用于解封装背压，并保留足够音频预读以降低短时调度抖动导致的断音。
 
 ### `void finishPackets()`
 
@@ -559,13 +593,14 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 2. 调用 `receiveFrame()` 优先取走解码器已有输出。
 3. 没有输出时等待 `Widget` 投递音频包。
 4. 调用 `sendPacket()` 投递压缩包。
-5. 将解码帧交给 `AudioResample::convert()`。
-6. 调用 `writePcm()` 把 PCM 分段写入音频设备。
-7. EOF 时 drain 解码器；退出时在本线程销毁音频设备。
+5. 用音频帧 `best_effort_timestamp` 和时间基确定音频时间轴起点。
+6. 将解码帧交给 `AudioResample::convert()`。
+7. 调用 `writePcm()` 把 PCM 分段写入音频设备，并更新已提交字节数和音频时钟。
+8. EOF 时 drain 解码器并等待设备缓冲播放完成；退出时在本线程销毁音频设备。
 
 ### `bool writePcm(const QByteArray &pcmData)`
 
-循环调用 `PlayAudio::write()`，直到整块 PCM 写完或收到退出请求。设备缓冲区已满时等待 5 ms 再重试。
+循环调用 `PlayAudio::write()`，直到整块 PCM 写完或收到退出请求。设备缓冲区已满时等待 5 ms 再重试。每次写入或等待都会使用 `QAudioOutput::processedUSecs()` 刷新音频播放时钟，并限制时钟不能超过已提交 PCM 的末尾。
 
 ### `void clearPackets()`
 
@@ -597,10 +632,9 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 1. 调用 `stopPlayback()` 清理上一个文件。
 2. 将 Qt 字符串转为 UTF-8 路径。
 3. 使用 `MyDemux::open()` 打开媒体。
-4. 取得视频编码参数并启动 `videoThread`。
-5. 取得音频编码参数并启动 `audioThread`；音频失败不阻止视频播放。
-6. 读取视频帧率并计算定时器间隔。
-7. 更新窗口标题、启动数据包定时器并立即分发第一批数据。
+4. 取得音频编码参数和时间基并启动 `audioThread`；音频失败不阻止视频播放。
+5. 取得视频编码参数和时间基，传入音频时钟来源并启动 `videoThread`。
+6. 更新窗口标题，以 1 ms 周期启动快速投包定时器并立即分发第一批数据。
 
 成功返回 `true`，打开或初始化解码器失败时返回 `false`。
 
@@ -608,13 +642,14 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 定时器驱动的数据包分发函数：
 
-1. 循环调用 `MyDemux::read()`。
-2. 将音频包交给 `audioThread::pushPacket()`。
-3. 将视频包交给 `videoThread::pushPacket()`，然后结束本次调用。
-4. 释放字幕等未处理的数据包。
-5. 文件结束时停止定时器，并调用两个线程的 `finishPackets()`。
+1. 先检查音频和视频包队列容量，任一队列满时暂停本轮读取。
+2. 循环调用 `MyDemux::read()`，单轮最多处理 256 个包。
+3. 将音频包交给 `audioThread::pushPacket()`。
+4. 将视频包交给 `videoThread::pushPacket()`。
+5. 释放字幕等未处理的数据包。
+6. 文件结束时停止定时器，并调用两个线程的 `finishPackets()`。
 
-单次调用最多检查 256 个包，以免解封装工作长时间占用 GUI 线程。
+定时器只负责快速预读，播放节奏由视频 PTS 和音频时钟决定。单次调用最多检查 256 个包，以免解封装工作长时间占用 GUI 线程。
 
 #### `void stopPlayback()`
 
@@ -629,7 +664,7 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 | `m_demux` | 值成员，生命周期与 `Widget` 相同 |
 | `m_videoThread` | 值成员，内部持有视频解码器和视频包队列 |
 | `m_audioThread` | 值成员，内部持有音频解码器、重采样器、播放设备和音频包队列 |
-| `m_packetTimer` | 值成员，通过 Qt 事件循环控制解封装和数据包分发节奏 |
+| `m_packetTimer` | 值成员，通过 Qt 事件循环快速分发数据包，队列容量实施背压 |
 
 ## 13. `main.cpp`：程序入口
 
@@ -669,11 +704,11 @@ Qt 5 中的 `QAudio` 是保存 `State`、`Error` 等枚举的命名空间，不�
 
 - 只渲染 `AV_PIX_FMT_YUV420P`，不支持 NV12、YUV422P、YUV444P、RGB 和硬件帧。
 - 片元着色器当前使用视频范围的 YUV 到 RGB 系数，未根据 `AVFrame::color_range` 和 `colorspace` 动态选择色彩矩阵。
-- 已实现音频播放，但尚未实现音画同步。
-- 音视频包队列当前都没有容量上限。
+- 已实现以音频设备播放进度为主时钟的视频等待/丢帧同步；尚未处理暂停、倍速和长期时钟漂移补偿。
+- 音视频包队列以包数量限制容量，尚未按照总字节数实施更精确的背压。
 - 音视频解码已经进入工作线程，但解封装仍由 GUI 定时器执行，网络流可能阻塞界面。
-- 播放节奏按照容器推测的平均帧率驱动，没有依据每帧 PTS 调度。
-- 尚未实现暂停、继续、进度条、seek 后解码状态重置、循环播放和音画同步。
+- GUI 投包节奏仍参考容器推测的平均帧率，视频最终显示时刻已经依据每帧 PTS 调度。
+- 尚未实现暂停、继续、进度条、seek 后解码状态重置和循环播放。
 - `MyDemux::read()` 目前无法区分正常 EOF 与读取错误。
 
 ## 16. 构建环境
@@ -703,14 +738,13 @@ D:\qt\Tools\mingw730_64\bin\mingw32-make.exe -j4
 
 每次链接成功后，qmake 会把 `avformat-63.dll`、`avcodec-63.dll`、`avutil-61.dll` 和 `swresample-7.dll` 自动复制到当前的 `debug` 或 `release` 输出目录。因此运行时不需要再把 FFmpeg 的 `bin` 目录加入系统 `PATH`。Qt 自身的 DLL 仍由 Qt Creator 的运行环境或 `windeployqt` 负责部署。
 
-工程没有带入 `ffmpeg.exe`、`ffplay.exe`、`ffprobe.exe` 和当前播放器未链接的滤镜等运行库。内置包的版本、内容和更新方法见 `third_party/ffmpeg/README.md`。FFmpeg DLL 由 Git LFS 管理，克隆项目的电脑需要安装 Git LFS 并执行 `git lfs pull`。
+工程没有带入 `ffmpeg.exe`、`ffplay.exe`、`ffprobe.exe` 和当前播放器未链接的滤镜等运行库。内置包的版本、内容和更新方法见 `third_party/ffmpeg/README.md`。当前 FFmpeg DLL 直接由普通 Git 管理，不要求克隆电脑安装 Git LFS。
 
 ## 17. 后续扩展建议
 
 建议按照以下顺序继续开发：
 
-1. 将解封装也移动到独立线程，并为音视频包队列增加容量和背压限制。
-2. 使用每帧 PTS 和流 `time_base` 进行播放调度。
-3. 增加暂停、继续和 seek；seek 后同时调用 `MyDemux::clear()` 与 `MyDecode::clear()`。
-4. 以音频设备播放时间作为主时钟实现音画同步。
-5. 根据实际需要增加其他像素格式转换或对应的 OpenGL shader。
+1. 将解封装也移动到独立线程，并将现有按包数量背压升级为按字节数背压。
+2. 增加暂停、继续和 seek；seek 后同时调用 `MyDemux::clear()` 与 `MyDecode::clear()`，并重置音视频时钟。
+3. 为音频时钟增加设备延迟校准、长期漂移补偿和倍速播放支持。
+4. 根据实际需要增加其他像素格式转换或对应的 OpenGL shader。

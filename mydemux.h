@@ -1,5 +1,10 @@
 #ifndef MYDEMUX_H
 #define MYDEMUX_H
+
+extern "C" {
+#include <libavutil/rational.h>
+}
+
 struct AVFormatContext;
 struct AVPacket;
 struct AVCodecParameters;
@@ -34,6 +39,12 @@ public:
 
     // 返回容器推测的视频帧率；无法确定时返回 0。
     virtual double videoFrameRate();
+
+    // 返回对应流的时间基。PTS 只有结合时间基才能换算成实际时间。
+    // 找不到对应流时返回无效时间基 {0, 1}。
+    virtual AVRational videoTimeBase();
+    virtual AVRational audioTimeBase();
+
     virtual bool Seek(double pos);
 protected:
     AVFormatContext * format = nullptr;
