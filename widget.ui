@@ -20,128 +20,172 @@
    <string>MyPlay2</string>
   </property>
   <property name="styleSheet">
-   <string notr="true">QWidget#Widget {
-    background-color: #15171c;
-    color: #e9edf3;
+   <string notr="true">QWidget {
     font-family: &quot;Microsoft YaHei UI&quot;;
     font-size: 13px;
 }
 
+QWidget#Widget {
+    background-color: #202020;
+    color: #ffffff;
+}
+
 QFrame#videoFrame {
-    background-color: #050607;
-    border: 1px solid #30343c;
-    border-radius: 10px;
+    background-color: #0c0c0c;
+    border: 1px solid #3d3d3d;
+    border-radius: 8px;
 }
 
 QFrame#controlPanel {
-    background-color: #20232a;
-    border: 1px solid #30343c;
-    border-radius: 10px;
+    background-color: #2b2b2b;
+    border: 1px solid #3d3d3d;
+    border-radius: 8px;
 }
 
 QLabel#appNameLabel {
-    color: #ffffff;
-    font-size: 20px;
+    color: #f5f5f5;
+    font-size: 18px;
     font-weight: 600;
 }
 
 QLabel#mediaTitleLabel {
-    color: #aeb6c2;
+    color: #c7c7c7;
 }
 
 QLabel#playbackStateLabel {
-    color: #72d7a7;
-    background-color: #19362c;
-    border: 1px solid #275744;
-    border-radius: 10px;
-    padding: 3px 10px;
+    color: #8a8a8a;
+    padding: 0 6px;
 }
 
 QLabel#currentTimeLabel,
 QLabel#totalTimeLabel,
 QLabel#volumeLabel,
 QLabel#speedLabel {
-    color: #b9c0ca;
+    color: #c7c7c7;
 }
 
 QPushButton {
     min-height: 32px;
-    padding: 0 14px;
-    color: #edf1f7;
-    background-color: #30343d;
-    border: 1px solid #414753;
-    border-radius: 6px;
+    padding: 0 12px;
+    color: #ffffff;
+    background-color: #333333;
+    border: 1px solid #454545;
+    border-radius: 4px;
 }
 
 QPushButton:hover {
-    background-color: #3a404b;
-    border-color: #586171;
+    background-color: #3d3d3d;
+    border-color: #505050;
 }
 
 QPushButton:pressed {
-    background-color: #272b33;
+    color: #c7c7c7;
+    background-color: #292929;
+    border-color: #393939;
+}
+
+QPushButton#openButton {
+    min-width: 84px;
+    background-color: #2d2d2d;
 }
 
 QPushButton#playPauseButton {
-    color: #ffffff;
-    background-color: #3978f6;
-    border-color: #4b86fa;
-    font-weight: 600;
+    min-width: 42px;
+    max-width: 42px;
+    min-height: 42px;
+    max-height: 42px;
+    padding: 0;
+    color: #0c0c0c;
+    background-color: #479ef5;
+    border: 1px solid #479ef5;
+    border-radius: 21px;
+    font-size: 17px;
 }
 
 QPushButton#playPauseButton:hover {
-    background-color: #4a86fa;
+    background-color: #62abf5;
+    border-color: #62abf5;
+}
+
+QPushButton#rewindButton,
+QPushButton#forwardButton,
+QPushButton#stopButton {
+    min-width: 46px;
+    padding: 0 8px;
+    background-color: transparent;
+    border-color: transparent;
+    font-size: 14px;
+}
+
+QPushButton#rewindButton:hover,
+QPushButton#forwardButton:hover,
+QPushButton#stopButton:hover {
+    background-color: #383838;
+    border-color: #383838;
 }
 
 QSlider::groove:horizontal {
-    height: 5px;
-    background-color: #414650;
-    border-radius: 2px;
+    height: 3px;
+    background-color: #5c5c5c;
+    border-radius: 1px;
 }
 
 QSlider::sub-page:horizontal {
-    background-color: #4a86fa;
-    border-radius: 2px;
+    background-color: #479ef5;
+    border-radius: 1px;
 }
 
 QSlider::handle:horizontal {
-    width: 14px;
+    width: 12px;
     margin: -5px 0;
-    background-color: #f4f7fb;
-    border: 2px solid #4a86fa;
-    border-radius: 7px;
+    background-color: #ffffff;
+    border: 1px solid #479ef5;
+    border-radius: 6px;
 }
 
 QComboBox {
     min-height: 30px;
-    min-width: 72px;
-    padding: 0 8px;
-    color: #edf1f7;
-    background-color: #30343d;
-    border: 1px solid #414753;
-    border-radius: 6px;
+    min-width: 70px;
+    padding: 0 9px;
+    color: #ffffff;
+    background-color: #333333;
+    border: 1px solid #454545;
+    border-radius: 4px;
+}
+
+QComboBox:hover {
+    background-color: #3d3d3d;
+    border-color: #505050;
+}
+
+QComboBox QAbstractItemView {
+    color: #ffffff;
+    background-color: #2b2b2b;
+    border: 1px solid #454545;
+    selection-background-color: #094771;
+    outline: 0;
 }</string>
   </property>
   <layout class="QVBoxLayout" name="mainLayout" stretch="0,1,0">
    <property name="spacing">
-    <number>10</number>
+    <number>12</number>
    </property>
    <property name="leftMargin">
-    <number>12</number>
+    <number>16</number>
    </property>
    <property name="topMargin">
-    <number>12</number>
+    <number>14</number>
    </property>
    <property name="rightMargin">
-    <number>12</number>
+    <number>16</number>
    </property>
    <property name="bottomMargin">
-    <number>12</number>
+    <number>14</number>
    </property>
    <item>
     <layout class="QHBoxLayout" name="titleLayout">
      <property name="spacing">
-      <number>10</number>
+      <number>8</number>
      </property>
      <item>
       <widget class="QLabel" name="appNameLabel">
@@ -172,10 +216,20 @@ QComboBox {
      <item>
       <widget class="QLabel" name="playbackStateLabel">
        <property name="text">
-        <string>就绪</string>
+        <string>●  就绪</string>
        </property>
        <property name="alignment">
         <set>Qt::AlignCenter</set>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="openButton">
+       <property name="toolTip">
+        <string>选择媒体文件</string>
+       </property>
+       <property name="text">
+        <string>打开文件</string>
        </property>
       </widget>
      </item>
@@ -192,7 +246,7 @@ QComboBox {
      <property name="minimumSize">
       <size>
        <width>0</width>
-       <height>320</height>
+       <height>300</height>
       </size>
      </property>
      <property name="frameShape">
@@ -224,16 +278,16 @@ QComboBox {
      </property>
      <layout class="QVBoxLayout" name="controlPanelLayout">
       <property name="spacing">
-       <number>9</number>
+       <number>8</number>
       </property>
       <property name="leftMargin">
-       <number>14</number>
+       <number>16</number>
       </property>
       <property name="topMargin">
        <number>12</number>
       </property>
       <property name="rightMargin">
-       <number>14</number>
+       <number>16</number>
       </property>
       <property name="bottomMargin">
        <number>12</number>
@@ -299,14 +353,17 @@ QComboBox {
          <number>8</number>
         </property>
         <item>
-         <widget class="QPushButton" name="openButton">
-          <property name="toolTip">
-           <string>选择媒体文件</string>
+         <spacer name="transportLeftSpacer">
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
           </property>
-          <property name="text">
-           <string>打开</string>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>24</width>
+            <height>20</height>
+           </size>
           </property>
-         </widget>
+         </spacer>
         </item>
         <item>
          <widget class="QPushButton" name="rewindButton">
@@ -314,7 +371,7 @@ QComboBox {
            <string>后退 10 秒</string>
           </property>
           <property name="text">
-           <string>-10 秒</string>
+           <string>↶ 10</string>
           </property>
          </widget>
         </item>
@@ -322,15 +379,21 @@ QComboBox {
          <widget class="QPushButton" name="playPauseButton">
           <property name="minimumSize">
            <size>
-            <width>86</width>
-            <height>0</height>
+            <width>42</width>
+            <height>42</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>42</width>
+            <height>42</height>
            </size>
           </property>
           <property name="toolTip">
            <string>播放或暂停</string>
           </property>
           <property name="text">
-           <string>播放</string>
+           <string>▶</string>
           </property>
          </widget>
         </item>
@@ -340,7 +403,7 @@ QComboBox {
            <string>停止播放</string>
           </property>
           <property name="text">
-           <string>停止</string>
+           <string>■</string>
           </property>
          </widget>
         </item>
@@ -350,7 +413,7 @@ QComboBox {
            <string>前进 10 秒</string>
           </property>
           <property name="text">
-           <string>+10 秒</string>
+           <string>10 ↷</string>
           </property>
          </widget>
         </item>
